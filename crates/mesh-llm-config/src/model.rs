@@ -1402,6 +1402,12 @@ pub struct LoggingConfig {
     #[serde(default = "default_retention_ttl_secs")]
     pub retention_ttl_secs: u64,
 
+    /// Maximum number of terminal summaries retained locally (default: 100_000).
+    /// Active summaries are never eligible for cap pruning. Must be between 1
+    /// and 1_000_000. Changes require a process restart.
+    #[serde(default = "default_retention_max_rows")]
+    pub retention_max_rows: u64,
+
     /// Maximum replay capacity in events (default: 128). Must be at least 1 and at most 10_000.
     #[serde(default = "default_replay_capacity")]
     pub replay_capacity: u32,
@@ -1441,6 +1447,10 @@ fn default_event_buffer_size() -> u64 {
 
 fn default_retention_ttl_secs() -> u64 {
     36 * 3600 // 36 hours
+}
+
+fn default_retention_max_rows() -> u64 {
+    100_000
 }
 
 fn default_replay_capacity() -> u32 {
@@ -1547,6 +1557,7 @@ impl Default for LoggingConfig {
             summary_line_limit: default_summary_limit(),
             event_buffer_size: default_event_buffer_size(),
             retention_ttl_secs: default_retention_ttl_secs(),
+            retention_max_rows: default_retention_max_rows(),
             replay_capacity: default_replay_capacity(),
             queue_capacity: default_queue_capacity(),
             artifact: LoggingArtifactConfig::default(),

@@ -258,6 +258,11 @@ impl OutputEventPresentation for OutputEvent {
 
     fn json_fields(&self) -> Map<String, Value> {
         let value = match self {
+            OutputEvent::CliCommandLifecycle { family, outcome } => json!({
+                "command_family": family.as_str(),
+                "code": outcome.code(),
+                "outcome": outcome.as_str(),
+            }),
             OutputEvent::Info { message, context } => {
                 json!({ "message": message, "context": context })
             }

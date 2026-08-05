@@ -5,9 +5,16 @@
 //! even when artifact content capture has been disabled.
 
 use crate::artifact_privacy::{ArtifactPrivacy, PlatformArtifactPrivacy};
-use crate::artifacts::{ArtifactFileStore, ArtifactRedactor, ArtifactWriteReceipt};
+use crate::artifacts::{
+    ArtifactContent, ArtifactFileStore, ArtifactRedactor, ArtifactWriteReceipt,
+};
 use crate::error::LogStoreError;
+use crate::repositories::CascadeArtifactPointer;
 use crate::store::{Clock, LogStore};
+use crate::{
+    DeleteOneRequest, MaintenanceExecutionControl, MaintenanceOperationId, MaintenanceReason,
+    MaintenanceReceipt,
+};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -180,5 +187,65 @@ impl FailOpenArtifactCapture {
     pub fn is_disabled(&self) -> bool {
         let state = self.state.lock().expect("capture state mutex poisoned");
         matches!(&*state, CaptureState::Disabled { .. })
+    }
+
+    /// Read an artifact through the same confined capture owner that wrote it.
+    ///
+    /// This remains a host-internal primitive: callers must first authorize
+    /// the query and verify the pointer's redaction metadata before returning
+    /// any bytes. A disabled capture facade deliberately exposes no file
+    /// content even when metadata remains available in SQLite.
+    pub fn read_artifact(&self, artifact_id: &str) -> Result<ArtifactContent, LogStoreError> {
+        let state = self.state.lock().expect("capture state mutex poisoned");
+        let CaptureState::Available(store) = &*state else {
+            return Err(LogStoreError::ArtifactMissing {
+                artifact_id: artifact_id.to_string(),
+            });
+        };
+        store.read_artifact(artifact_id)
+    }
+
+    /// Remove only files whose durable pointers were already selected by a
+    /// committed cascade cleanup. A disabled capture facade has no trusted
+    /// artifact root to touch, so it deliberately becomes a no-op.
+    ///
+    /// The caller owns the database transaction that produced `pointers`.
+    /// This method is intentionally best-effort because cleanup must never
+    /// turn a local storage fault into request-serving failure.
+    pub fn delete_cascade_artifact_files(&self, pointers: &[CascadeArtifactPointer]) {
+        let state = self.state.lock().expect("capture state mutex poisoned");
+        if let CaptureState::Available(store) = &*state {
+            store.delete_artifact_files(pointers);
+        }
+    }
+
+    /// Execute a receipt-backed cleanup through the confined artifact owner.
+    /// Receipts expose only IDs and counts; they never expose artifact paths.
+    pub fn execute_cleanup(
+        &self,
+        operation_id: MaintenanceOperationId,
+        reason: &MaintenanceReason,
+        control: &dyn MaintenanceExecutionControl,
+    ) -> Result<MaintenanceReceipt, LogStoreError> {
+        let state = self.state.lock().expect("capture state mutex poisoned");
+        let CaptureState::Available(store) = &*state else {
+            return Err(LogStoreError::MaintenanceExecutionCancelled);
+        };
+        store.execute_cleanup(operation_id, reason, control)
+    }
+
+    /// Delete one terminal request through the same confined artifact owner
+    /// that persisted its content. A disabled capture facade deliberately
+    /// declines the operation because it has no trusted artifact root.
+    pub fn delete_request_cascade(
+        &self,
+        request: &DeleteOneRequest,
+        control: &dyn MaintenanceExecutionControl,
+    ) -> Result<MaintenanceReceipt, LogStoreError> {
+        let state = self.state.lock().expect("capture state mutex poisoned");
+        let CaptureState::Available(store) = &*state else {
+            return Err(LogStoreError::MaintenanceExecutionCancelled);
+        };
+        store.delete_request_cascade(request, control)
     }
 }

@@ -6,7 +6,10 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::Notify;
+use mesh_llm_events::logging::replay::{ReplayChannel, ReplaySequence};
+use tokio::sync::{Notify, broadcast};
+
+use super::metrics::{LoggingMetric, LoggingMetrics};
 
 /// Entry on the replay bus carrying a serialized event payload.
 #[derive(Clone, Debug)]
@@ -39,10 +42,11 @@ pub enum PushOutcome {
 /// When `push` is called and the queue is already at capacity, the oldest entry
 /// is evicted (popped from the front) before the new entry is appended. This ensures
 /// recent context survives under pressure while older entries are discarded.
-#[derive(Debug)]
 pub struct ReplayBus {
     state: Mutex<ReplayBusState>,
     notify: Notify,
+    updates: broadcast::Sender<()>,
+    metrics: LoggingMetrics,
 
     /// Number of new events that could not be accepted by the bus.
     pub drops: Arc<AtomicU64>,
@@ -54,18 +58,126 @@ pub struct ReplayBus {
 #[derive(Debug)]
 struct ReplayBusState {
     capacity: usize,
+    /// One-time delivery ownership for the persistence worker. Draining this
+    /// queue must never consume the independently readable replay history.
     entries: VecDeque<BusEntry>,
+    replay: ReplayHistory,
+}
+
+/// Per-channel position carried by an SSE `id:` value. A vector cursor is
+/// necessary because lifecycle sequences are monotonic per replay channel.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReplayCursor {
+    requests: u64,
+    operations: u64,
+    system: u64,
+}
+
+impl ReplayCursor {
+    pub fn sequence(self, channel: ReplayChannel) -> u64 {
+        match channel {
+            ReplayChannel::Requests => self.requests,
+            ReplayChannel::Operations => self.operations,
+            ReplayChannel::System => self.system,
+        }
+    }
+
+    fn advance(&mut self, replay: ReplaySequence) {
+        let slot = match replay.channel {
+            ReplayChannel::Requests => &mut self.requests,
+            ReplayChannel::Operations => &mut self.operations,
+            ReplayChannel::System => &mut self.system,
+        };
+        *slot = (*slot).max(replay.sequence);
+    }
+}
+
+/// A replayable copy of an admitted bus entry. The payload is still internal;
+/// the logs SSE semantic module projects it to a privacy-safe public DTO.
+#[derive(Clone, Debug)]
+pub struct ReplayRecord {
+    pub entry: BusEntry,
+    pub replay: ReplaySequence,
+    pub cursor: ReplayCursor,
+}
+
+/// Non-destructive snapshot of the bounded replay window.
+#[derive(Clone, Debug)]
+pub struct ReplayWindow {
+    pub records: Vec<ReplayRecord>,
+    /// Highest sequence that was evicted for each channel. A reconnect whose
+    /// cursor is behind this boundary must receive a replay-gap frame.
+    pub evicted_through: ReplayCursor,
+    pub latest: ReplayCursor,
+}
+
+#[derive(Debug)]
+struct ReplayHistory {
+    records: VecDeque<ReplayRecord>,
+    evicted_through: ReplayCursor,
+    latest: ReplayCursor,
+}
+
+impl ReplayHistory {
+    fn new(capacity: usize) -> Self {
+        Self {
+            records: VecDeque::with_capacity(capacity),
+            evicted_through: ReplayCursor::default(),
+            latest: ReplayCursor::default(),
+        }
+    }
+
+    fn push(&mut self, capacity: usize, entry: BusEntry, replay: ReplaySequence) -> bool {
+        self.latest.advance(replay);
+        let evicted = if self.records.len() >= capacity {
+            if let Some(record) = self.records.pop_front() {
+                self.evicted_through.advance(record.replay);
+            }
+            true
+        } else {
+            false
+        };
+        self.records.push_back(ReplayRecord {
+            entry,
+            replay,
+            cursor: self.latest,
+        });
+        evicted
+    }
+
+    fn trim_to(&mut self, capacity: usize) -> u64 {
+        let mut evicted = 0;
+        while self.records.len() > capacity {
+            if let Some(record) = self.records.pop_front() {
+                self.evicted_through.advance(record.replay);
+                evicted += 1;
+            }
+        }
+        evicted
+    }
+
+    fn snapshot(&self) -> ReplayWindow {
+        ReplayWindow {
+            records: self.records.iter().cloned().collect(),
+            evicted_through: self.evicted_through,
+            latest: self.latest,
+        }
+    }
 }
 
 impl ReplayBus {
     /// Create a new bus with the given capacity.
     pub fn new(capacity: usize) -> Self {
+        let (updates, _) = broadcast::channel(capacity.max(1));
         Self {
             state: Mutex::new(ReplayBusState {
                 capacity,
                 entries: VecDeque::with_capacity(capacity),
+                replay: ReplayHistory::new(capacity),
             }),
             notify: Notify::new(),
+            updates,
+            metrics: LoggingMetrics::default(),
             drops: Arc::new(AtomicU64::new(0)),
             evictions: Arc::new(AtomicU64::new(0)),
         }
@@ -79,28 +191,66 @@ impl ReplayBus {
     /// Push with a channel hint for downstream routing.
     #[allow(dead_code)]
     pub fn push_with_hint(&self, payload: String, channel_hint: u8) -> PushOutcome {
+        self.push_inner(payload, channel_hint, None)
+    }
+
+    /// Push a canonical lifecycle event and retain an independently readable
+    /// replay copy. Persistence workers still receive only the delivery queue.
+    pub fn push_replay(
+        &self,
+        payload: String,
+        channel_hint: u8,
+        replay: ReplaySequence,
+    ) -> PushOutcome {
+        self.push_inner(payload, channel_hint, Some(replay))
+    }
+
+    fn push_inner(
+        &self,
+        payload: String,
+        channel_hint: u8,
+        replay: Option<ReplaySequence>,
+    ) -> PushOutcome {
         let mut state = self.state.lock().expect("bus mutex poisoned");
 
         if state.capacity == 0 {
             self.drops.fetch_add(1, Ordering::Relaxed);
+            drop(state);
+            self.metrics
+                .record(LoggingMetric::ReplayDropped { count: 1 });
             return PushOutcome::Rejected;
         }
 
-        let outcome = if state.entries.len() >= state.capacity {
+        let delivery_evicted = if state.entries.len() >= state.capacity {
             // Drop oldest to make room.
             state.entries.pop_front();
+            true
+        } else {
+            false
+        };
+
+        let entry = BusEntry {
+            payload,
+            channel_hint,
+        };
+        state.entries.push_back(entry.clone());
+        let capacity = state.capacity;
+        let replay_evicted = replay
+            .map(|replay| state.replay.push(capacity, entry, replay))
+            .unwrap_or(false);
+        let outcome = if delivery_evicted || replay_evicted {
             self.evictions.fetch_add(1, Ordering::Relaxed);
             PushOutcome::EvictedOldest
         } else {
             PushOutcome::Enqueued
         };
-
-        state.entries.push_back(BusEntry {
-            payload,
-            channel_hint,
-        });
         drop(state);
+        if matches!(outcome, PushOutcome::EvictedOldest) {
+            self.metrics
+                .record(LoggingMetric::ReplayEvicted { count: 1 });
+        }
         self.notify.notify_one();
+        let _ = self.updates.send(());
         outcome
     }
 
@@ -108,6 +258,16 @@ impl ReplayBus {
     pub fn drain(&self) -> Vec<BusEntry> {
         let mut state = self.state.lock().expect("bus mutex poisoned");
         state.entries.drain(..).collect()
+    }
+
+    /// Snapshot the separately retained replay history without consuming it.
+    /// This remains available after the persistence worker drains delivery.
+    pub fn replay_window(&self) -> ReplayWindow {
+        self.state
+            .lock()
+            .expect("bus mutex poisoned")
+            .replay
+            .snapshot()
     }
 
     /// Current number of buffered entries (for observability / tests).
@@ -132,15 +292,35 @@ impl ReplayBus {
     pub fn set_capacity(&self, capacity: usize) -> u64 {
         let mut state = self.state.lock().expect("bus mutex poisoned");
         state.capacity = capacity;
-        let mut evicted = 0;
+        let mut delivery_evicted = 0;
         while state.entries.len() > capacity {
             state.entries.pop_front();
-            evicted += 1;
+            delivery_evicted += 1;
         }
+        let replay_evicted = state.replay.trim_to(capacity);
+        let evicted = delivery_evicted.max(replay_evicted);
         if evicted != 0 {
             self.evictions.fetch_add(evicted, Ordering::Relaxed);
         }
+        drop(state);
+        if evicted != 0 {
+            self.metrics
+                .record(LoggingMetric::ReplayEvicted { count: evicted });
+        }
         evicted
+    }
+
+    /// Record replay gaps only where an existing SSE session has determined
+    /// that an evicted cursor requires recovery. This does not alter the
+    /// replay protocol or expose its cursor/channel values to telemetry.
+    pub(crate) fn record_replay_gaps(&self, count: u64) {
+        if count != 0 {
+            self.metrics.record(LoggingMetric::ReplayGap { count });
+        }
+    }
+
+    pub(crate) fn metrics(&self) -> LoggingMetrics {
+        self.metrics.clone()
     }
 
     #[allow(dead_code)]
@@ -151,6 +331,13 @@ impl ReplayBus {
     /// Wait until at least one entry is available (or the bus has been signalled).
     pub async fn notified(&self) {
         self.notify.notified().await;
+    }
+
+    /// Subscribe to accepted replay updates. Each SSE connection owns its
+    /// receiver, so one slow or cancelled subscriber cannot consume another
+    /// connection's wakeup signal.
+    pub fn subscribe_updates(&self) -> broadcast::Receiver<()> {
+        self.updates.subscribe()
     }
 
     /// Clone the drops counter for external observation.
@@ -264,5 +451,62 @@ mod tests {
         assert_eq!(bus.push("b".into()), PushOutcome::Enqueued);
         assert_eq!(bus.evictions.load(Ordering::Relaxed), 0);
         assert_eq!(bus.len(), 2);
+    }
+
+    #[test]
+    fn replay_window_survives_a_persistence_drain() {
+        let bus = ReplayBus::new(2);
+        bus.push_replay(
+            "first".into(),
+            0,
+            ReplaySequence::next(ReplayChannel::Requests, 1),
+        );
+        bus.push_replay(
+            "second".into(),
+            1,
+            ReplaySequence::next(ReplayChannel::Operations, 1),
+        );
+
+        assert_eq!(bus.drain().len(), 2);
+        assert!(bus.is_empty(), "delivery queue was consumed");
+        let replay = bus.replay_window();
+        assert_eq!(replay.records.len(), 2, "replay remains readable");
+        assert_eq!(replay.records[0].replay.sequence, 1);
+        assert_eq!(replay.records[1].replay.channel, ReplayChannel::Operations);
+    }
+
+    #[test]
+    fn replay_window_reports_per_channel_eviction_boundary() {
+        let bus = ReplayBus::new(1);
+        bus.push_replay(
+            "old".into(),
+            0,
+            ReplaySequence::next(ReplayChannel::Requests, 1),
+        );
+        bus.push_replay(
+            "new".into(),
+            0,
+            ReplaySequence::next(ReplayChannel::Requests, 2),
+        );
+
+        let replay = bus.replay_window();
+        assert_eq!(replay.evicted_through.sequence(ReplayChannel::Requests), 1);
+        assert_eq!(replay.latest.sequence(ReplayChannel::Requests), 2);
+        assert_eq!(replay.records[0].replay.sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn replay_updates_fan_out_to_each_subscriber() {
+        let bus = ReplayBus::new(1);
+        let mut first = bus.subscribe_updates();
+        let mut second = bus.subscribe_updates();
+        bus.push_replay(
+            "event".into(),
+            0,
+            ReplaySequence::next(ReplayChannel::Requests, 1),
+        );
+
+        assert!(first.recv().await.is_ok());
+        assert!(second.recv().await.is_ok());
     }
 }

@@ -10,6 +10,9 @@ use std::sync::{Arc, OnceLock, RwLock};
 pub mod logging;
 pub mod terminal_progress;
 
+mod command_lifecycle;
+pub use command_lifecycle::{CliCommandFamily, CliCommandOutcome, emit_cli_command_event};
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum LogFormat {
     #[default]
@@ -402,6 +405,10 @@ impl LlamaInstanceKind {
 #[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
 pub enum OutputEvent {
+    CliCommandLifecycle {
+        family: CliCommandFamily,
+        outcome: CliCommandOutcome,
+    },
     Info {
         message: String,
         context: Option<String>,
@@ -582,6 +589,7 @@ pub enum OutputEvent {
 impl OutputEvent {
     pub fn event_name(&self) -> &'static str {
         match self {
+            OutputEvent::CliCommandLifecycle { .. } => "cli_command_lifecycle",
             OutputEvent::Info { .. } => "info",
             OutputEvent::Startup { .. } => "startup",
             OutputEvent::LaunchPlan { .. } => "launch_plan",
@@ -627,6 +635,7 @@ impl OutputEvent {
 
     pub fn level(&self) -> OutputLevel {
         match self {
+            OutputEvent::CliCommandLifecycle { outcome, .. } => outcome.level(),
             OutputEvent::RpcStartupFailed { .. } | OutputEvent::LlamaStartupFailed { .. } => {
                 OutputLevel::Error
             }
@@ -640,6 +649,9 @@ impl OutputEvent {
 
     pub fn message(&self) -> String {
         match self {
+            OutputEvent::CliCommandLifecycle { family, outcome } => {
+                format!("CLI command {} ({})", outcome.as_str(), family.as_str())
+            }
             OutputEvent::Info { message, .. } => message.clone(),
             OutputEvent::Startup { message, .. } => message
                 .clone()

@@ -1,5 +1,6 @@
 use crate::api;
 use crate::inference::{election, pipeline};
+use crate::logging::{OpenAiLifecycleAttachment, OpenAiRouteObserver};
 use crate::mesh;
 use crate::network::affinity;
 use crate::network::openai::auto_route;
@@ -33,6 +34,32 @@ struct AutoRouteDecision {
     effective_model: Option<String>,
     classification: Option<router::Classification>,
     required_tokens: Option<u32>,
+}
+
+/// Outcome owned by the ingress boundary for a plugin route.
+///
+/// Downstream plugin dispatch can emit route/attempt metadata, but it must not
+/// terminalize the request itself. The parent ingress maps this small,
+/// payload-free outcome to exactly one terminal lifecycle event after routing
+/// returns.
+enum PluginRouteOutcome {
+    Completed,
+    Failed(&'static str),
+    Rejected(&'static str),
+}
+
+fn terminal_outcome_for_plugin_route(
+    outcome: Option<PluginRouteOutcome>,
+) -> crate::logging::TerminalOutcome {
+    match outcome {
+        Some(PluginRouteOutcome::Failed(reason)) => {
+            crate::logging::TerminalOutcome::Failed(reason.into())
+        }
+        Some(PluginRouteOutcome::Rejected(reason)) => {
+            crate::logging::TerminalOutcome::Rejected(Some(reason.into()))
+        }
+        Some(PluginRouteOutcome::Completed) | None => crate::logging::TerminalOutcome::Completed,
+    }
 }
 
 /// Check activity policy admission and reject with 503 if paused.
@@ -444,7 +471,8 @@ async fn route_missing_local_model(
     ctx: &IngressRouteContext<'_>,
     model_name: &str,
     required_tokens: Option<u32>,
-) {
+    route_observer: OpenAiRouteObserver<'_>,
+) -> Option<PluginRouteOutcome> {
     // Try remote mesh first.
     if let Some(mesh_targets) = remote_mesh_targets(ctx, model_name).await {
         let routed = proxy::route_model_request(
@@ -453,12 +481,15 @@ async fn route_missing_local_model(
             &mesh_targets,
             model_name,
             request,
-            required_tokens,
-            ctx.affinity,
+            proxy::RouteModelRequestContext {
+                required_tokens,
+                affinity: ctx.affinity,
+                route_observer,
+            },
         )
         .await;
         debug_assert!(routed);
-        return;
+        return None;
     }
 
     // Check if the model is known locally but unavailable
@@ -470,13 +501,14 @@ async fn route_missing_local_model(
             &format!("model '{model_name}' is unavailable locally (loading or draining)"),
         )
         .await;
-        return;
+        return None;
     }
 
     // Try plugin dispatch (admission-checked inside).
     if ctx.plugin_manager.is_some() {
-        try_route_plugin_model(ctx, tcp_stream, request, model_name).await;
-        return;
+        return Some(
+            try_route_plugin_model(ctx, tcp_stream, request, model_name, route_observer).await,
+        );
     }
 
     // Model not found anywhere — return 404. This replaces the old fallback behavior that would
@@ -487,6 +519,7 @@ async fn route_missing_local_model(
         &format!("model '{model_name}' not found (no local or remote host serving this model)"),
     )
     .await;
+    None
 }
 
 /// Check whether the model is known locally but currently unavailable — all local candidates are None.
@@ -522,7 +555,8 @@ async fn try_route_plugin_model(
     mut tcp_stream: tokio::net::TcpStream,
     request: &proxy::BufferedHttpRequest,
     model_name: &str,
-) {
+    route_observer: OpenAiRouteObserver<'_>,
+) -> PluginRouteOutcome {
     // Admission check for plugin dispatch ingress.
     match check_activity_admission(
         tcp_stream,
@@ -532,7 +566,14 @@ async fn try_route_plugin_model(
     .await
     {
         Ok(stream) => tcp_stream = stream,
-        Err(()) => return,
+        Err(()) => {
+            route_observer.route_selected_with_metadata(
+                Some(model_name),
+                Some("plugin"),
+                Some("admission"),
+            );
+            return PluginRouteOutcome::Rejected("plugin_admission_denied");
+        }
     }
 
     let plugin_manager = ctx
@@ -546,11 +587,14 @@ async fn try_route_plugin_model(
             let routed = proxy::route_http_endpoint_request(
                 ctx.node,
                 Some(model_name),
+                proxy::RouteSelectionMetadata {
+                    provider: Some(&endpoint.plugin_name),
+                    engine: Some(&endpoint.endpoint_id),
+                },
                 &mut tcp_stream,
                 &endpoint.address,
-                &request.raw,
-                &request.path,
-                request.response_adapter,
+                request,
+                route_observer,
             )
             .await;
             if !routed {
@@ -559,9 +603,17 @@ async fn try_route_plugin_model(
                     &format!("plugin endpoint for model '{model_name}' failed"),
                 )
                 .await;
+                PluginRouteOutcome::Failed("plugin_endpoint_failed")
+            } else {
+                PluginRouteOutcome::Completed
             }
         }
         Ok(None) => {
+            route_observer.route_selected_with_metadata(
+                Some(model_name),
+                Some("plugin"),
+                Some("inference_endpoint"),
+            );
             // Plugin manager exists but doesn't serve this model — send 404.
             let _ = proxy::send_error(
                 tcp_stream,
@@ -571,6 +623,7 @@ async fn try_route_plugin_model(
                 ),
             )
             .await;
+            PluginRouteOutcome::Rejected("plugin_model_not_found")
         }
         Err(error) => {
             tracing::warn!(
@@ -578,12 +631,18 @@ async fn try_route_plugin_model(
                 model_name,
                 error
             );
+            route_observer.route_selected_with_metadata(
+                Some(model_name),
+                Some("plugin"),
+                Some("inference_endpoint"),
+            );
             // Plugin resolution failure — degrade gracefully with 503. The daemon stays alive; only the affected capability is degraded.
             let _ = proxy::send_503(
                 tcp_stream,
                 &format!("plugin endpoint for model '{model_name}' unavailable"),
             )
             .await;
+            PluginRouteOutcome::Failed("plugin_endpoint_resolution_failed")
         }
     }
 }
@@ -594,12 +653,20 @@ async fn route_request(
     ctx: &IngressRouteContext<'_>,
     effective_model: Option<&str>,
     required_tokens: Option<u32>,
-) {
+    route_observer: OpenAiRouteObserver<'_>,
+) -> Option<PluginRouteOutcome> {
     if let Some(model_name) = effective_model {
         // Model explicitly requested. Check local candidates first.
         if !has_available_candidates(ctx.targets, model_name) {
-            route_missing_local_model(tcp_stream, request, ctx, model_name, required_tokens).await;
-            return;
+            return route_missing_local_model(
+                tcp_stream,
+                request,
+                ctx,
+                model_name,
+                required_tokens,
+                route_observer,
+            )
+            .await;
         }
 
         // Local candidates available — route normally.
@@ -612,8 +679,11 @@ async fn route_request(
             ctx.targets,
             model_name,
             request,
-            required_tokens,
-            ctx.affinity,
+            proxy::RouteModelRequestContext {
+                required_tokens,
+                affinity: ctx.affinity,
+                route_observer,
+            },
         )
         .await;
         debug_assert!(routed);
@@ -626,10 +696,15 @@ async fn route_request(
             None,
             first_available_target(ctx.targets),
             &request.raw,
-            request.response_adapter,
+            proxy::RouteTargetContext {
+                request_id: request.request_id,
+                response_adapter: request.response_adapter,
+                route_observer,
+            },
         )
         .await;
     }
+    None
 }
 
 async fn prepare_auto_route_decision(
@@ -743,14 +818,6 @@ enum MoaInterceptResult {
     /// Not an MoA request — caller should continue with normal routing,
     /// reusing the returned stream.
     NotMoa(tokio::net::TcpStream),
-    /// MoA could not form a committee but degraded `model=mesh` to a real
-    /// single model (already rewritten on the request). Caller routes it
-    /// normally, but must use this model rather than the stale
-    /// `decision.effective_model` (still "mesh").
-    Degraded {
-        stream: tokio::net::TcpStream,
-        model: Option<String>,
-    },
 }
 
 /// Dispatch to the MoA gateway when `model == "mesh"`. Self-gates on the
@@ -764,15 +831,14 @@ async fn try_handle_moa_intercept(
     if decision.effective_model.as_deref() != Some(moa::VIRTUAL_MODEL_NAME) {
         return MoaInterceptResult::NotMoa(tcp_stream);
     }
-    // `try_handle_moa` self-gates on the model name. It consumes the stream and
-    // returns `None` when it owns the response (a MoA turn, a 400, or — no
-    // model at all — a 503). But when it cannot form a committee yet still has
-    // a model to serve, it degrades: it rewrites `model=mesh` to a real model
-    // (on `request`) and hands the stream *back* as `Some`, so a lone node
-    // answers as an ordinary single-model request instead of erroring. In that
-    // case the pre-computed `decision.effective_model` is stale ("mesh"), so we
-    // carry the degraded model name out for the caller to route on.
-    match crate::network::openai::moa_gateway::try_handle_moa(
+    // `try_handle_moa` self-gates on the model name and consumes the
+    // stream when it accepts. The outer gate above guarantees the gate
+    // matches, so the inner call always returns `None` here — the stream
+    // is gone, either with the MoA response, a 503, or a 400. Discard
+    // the return value explicitly. The previous shape kept an
+    // `if let Some(_) = … { tracing::error!(...) }` branch that could
+    // never fire and made the control flow confusing to read.
+    let _ = crate::network::openai::moa_gateway::try_handle_moa(
         ctx.route.node,
         tcp_stream,
         request,
@@ -780,18 +846,9 @@ async fn try_handle_moa_intercept(
         Some(ctx.route.targets),
         decision.required_tokens,
     )
-    .await
-    {
-        Some(stream) => MoaInterceptResult::Degraded {
-            stream,
-            model: request.model_name.clone(),
-        },
-        None => {
-            proxy::release_request_objects(ctx.route.node, &request.request_object_request_ids)
-                .await;
-            MoaInterceptResult::Handled
-        }
-    }
+    .await;
+    proxy::release_request_objects(ctx.route.node, &request.request_object_request_ids).await;
+    MoaInterceptResult::Handled
 }
 
 async fn handle_buffered_api_request(
@@ -799,8 +856,22 @@ async fn handle_buffered_api_request(
     mut request: proxy::BufferedHttpRequest,
     ctx: ProxyConnectionContext<'_>,
 ) {
+    // Claim the parent at host OpenAI ingress. All downstream dispatch sees
+    // only a metadata observer; this scope remains the sole terminal owner.
+    let request_metadata =
+        crate::logging::RequestSummaryMetadata::from_openai_ingress_path(&request.client_path);
+    let mut lifecycle = crate::logging_runtime_state()
+        .map(|state| state.openai_ingress_attachment(request.request_id, request_metadata))
+        .unwrap_or_else(OpenAiLifecycleAttachment::unowned);
+    if lifecycle.owns_parent() {
+        request.mark_raw_lifecycle_owned();
+    }
+
     let tcp_stream = match maybe_handle_control_request(tcp_stream, &request, &ctx).await {
-        Ok(()) => return,
+        Ok(()) => {
+            lifecycle.terminal(crate::logging::TerminalOutcome::Completed);
+            return;
+        }
         Err(tcp_stream) => tcp_stream,
     };
 
@@ -811,6 +882,7 @@ async fn handle_buffered_api_request(
 
     if proxy::is_drop_request(&request.method, &request.path) {
         handle_mesh_unload_request(tcp_stream, &request, ctx.control_tx).await;
+        lifecycle.terminal(crate::logging::TerminalOutcome::Completed);
         return;
     }
 
@@ -824,49 +896,55 @@ async fn handle_buffered_api_request(
     .await
     {
         Ok(stream) => stream,
-        Err(()) => return,
+        Err(()) => {
+            lifecycle.terminal(crate::logging::TerminalOutcome::Rejected(Some(
+                "admission_denied".into(),
+            )));
+            return;
+        }
     };
 
     let decision = match prepare_auto_route_decision(&mut request, &ctx.route, &descriptors).await {
         Ok(decision) => decision,
         Err(()) => {
             send_media_unsupported(tcp_stream).await;
+            lifecycle.terminal(crate::logging::TerminalOutcome::Rejected(Some(
+                "unsupported_media".into(),
+            )));
             return;
         }
     };
 
-    // Effective model for downstream routing. Normally the pre-computed
-    // decision, but a degraded MoA turn overrides it with the single model it
-    // fell back to (the decision still says "mesh").
-    let mut routing_model = decision.effective_model.clone();
     let tcp_stream = match try_handle_moa_intercept(tcp_stream, &mut request, &ctx, &decision).await
     {
-        MoaInterceptResult::Handled => return,
-        MoaInterceptResult::NotMoa(stream) => stream,
-        MoaInterceptResult::Degraded { stream, model } => {
-            routing_model = model;
-            stream
+        MoaInterceptResult::Handled => {
+            lifecycle.terminal(crate::logging::TerminalOutcome::Completed);
+            return;
         }
+        MoaInterceptResult::NotMoa(stream) => stream,
     };
 
     let mut tcp_stream = tcp_stream;
-    // A degraded turn is a plain single-model request; skip the pipeline
-    // classifier (computed against "mesh") and route it directly.
-    let degraded = routing_model != decision.effective_model;
-    if !degraded && try_pipeline_route(&mut tcp_stream, &mut request, &ctx.route, &decision).await {
+    if try_pipeline_route(&mut tcp_stream, &mut request, &ctx.route, &decision).await {
         proxy::release_request_objects(ctx.route.node, &request.request_object_request_ids).await;
+        lifecycle.terminal(crate::logging::TerminalOutcome::Completed);
         return;
     }
 
-    route_request(
-        tcp_stream,
-        &mut request,
-        &ctx.route,
-        routing_model.as_deref(),
-        decision.required_tokens,
-    )
-    .await;
+    let plugin_outcome = {
+        let route_observer = lifecycle.route_observer();
+        route_request(
+            tcp_stream,
+            &mut request,
+            &ctx.route,
+            decision.effective_model.as_deref(),
+            decision.required_tokens,
+            route_observer,
+        )
+        .await
+    };
     proxy::release_request_objects(ctx.route.node, &request.request_object_request_ids).await;
+    lifecycle.terminal(terminal_outcome_for_plugin_route(plugin_outcome));
 }
 
 async fn handle_api_proxy_connection(
@@ -1026,6 +1104,14 @@ pub(crate) fn callable_models(targets: &election::ModelTargets) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use crate::logging::{
+        LoggingService, OpenAiLifecycleAttachment, RawMeshLifecycleOwners, RawMeshRequestLifecycle,
+        TerminalOutcome,
+    };
+    use mesh_llm_events::logging::{events::LifecycleEvent, identifiers::RequestId};
+
     use super::*;
 
     fn large_tokenize_request(model: &str) -> proxy::BufferedHttpRequest {
@@ -1034,6 +1120,7 @@ mod tests {
             method: "POST".to_owned(),
             path: "/v1/tokenize".to_owned(),
             client_path: "/v1/tokenize".to_owned(),
+            request_id: RequestId::default(),
             body_json: None,
             body_json_attempted: false,
             body_bytes: None,
@@ -1043,6 +1130,67 @@ mod tests {
             model_name: Some(model.to_owned()),
             request_object_request_ids: Vec::new(),
             response_adapter: proxy::ResponseAdapter::None,
+        }
+    }
+
+    fn recorded_lifecycle_events(service: &LoggingService) -> Vec<LifecycleEvent> {
+        service
+            .bus_ref()
+            .replay_window()
+            .records
+            .into_iter()
+            .filter_map(|record| {
+                let envelope =
+                    serde_json::from_str::<serde_json::Value>(&record.entry.payload).ok()?;
+                let payload = envelope.get("payload")?.as_str()?;
+                serde_json::from_str(payload).ok()
+            })
+            .collect()
+    }
+
+    fn plugin_lifecycle() -> (Arc<LoggingService>, OpenAiLifecycleAttachment) {
+        let service = Arc::new(LoggingService::new_disabled(Default::default()));
+        let parent = RawMeshRequestLifecycle::register(
+            Arc::clone(&service),
+            Arc::new(RawMeshLifecycleOwners::default()),
+            RequestId::new(),
+        )
+        .expect("plugin test should claim one parent");
+        (service, OpenAiLifecycleAttachment::new(Some(parent)))
+    }
+
+    fn record_plugin_attempt(
+        observer: OpenAiRouteObserver<'_>,
+        model: &str,
+        provider: &str,
+        engine: &str,
+        result: super::super::response::RouteAttemptResult,
+    ) -> super::super::response::RouteAttemptResult {
+        observer.route_selected_with_metadata(Some(model), Some(provider), Some(engine));
+        let attempt_id = observer.start_attempt();
+        match result {
+            super::super::response::RouteAttemptResult::Delivered { status_code, .. } => {
+                observer.complete_attempt(attempt_id, status_code);
+            }
+            _ => observer.fail_attempt(
+                attempt_id,
+                super::super::response::route_attempt_result_label(&result),
+            ),
+        }
+        result
+    }
+
+    fn assert_payload_free(events: &[LifecycleEvent]) {
+        let serialized = serde_json::to_string(events).expect("events should serialize");
+        for forbidden in [
+            "body",
+            "headers",
+            "prompt",
+            "authorization",
+            "secret",
+            "completion",
+        ] {
+            assert!(!serialized.to_ascii_lowercase().contains(forbidden));
         }
     }
 
@@ -1290,5 +1438,194 @@ mod tests {
             .await,
             vec![target]
         );
+    }
+
+    #[test]
+    fn plugin_route_success_records_one_attempt_and_one_terminal_outcome() {
+        let (service, mut attachment) = plugin_lifecycle();
+        let observer = attachment.route_observer();
+        let result = record_plugin_attempt(
+            observer,
+            "plugin-model",
+            "acme/plugin",
+            "endpoint-prod",
+            super::super::response::RouteAttemptResult::Delivered {
+                status_code: 200,
+                completion_tokens: None,
+            },
+        );
+        assert!(matches!(
+            result,
+            super::super::response::RouteAttemptResult::Delivered {
+                status_code: 200,
+                ..
+            }
+        ));
+
+        attachment.terminal(terminal_outcome_for_plugin_route(Some(
+            PluginRouteOutcome::Completed,
+        )));
+        attachment.terminal(TerminalOutcome::Failed("late_plugin_failure".into()));
+
+        let events = recorded_lifecycle_events(&service);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, LifecycleEvent::RouteSelected { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, LifecycleEvent::AttemptStarted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, LifecycleEvent::AttemptCompleted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, LifecycleEvent::Completed { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, LifecycleEvent::Failed { .. }))
+                .count(),
+            0
+        );
+        match events
+            .iter()
+            .find(|event| matches!(event, LifecycleEvent::RouteSelected { .. }))
+        {
+            Some(LifecycleEvent::RouteSelected {
+                model,
+                provider,
+                engine,
+            }) => {
+                assert_eq!(model.as_deref(), Some("plugin-model"));
+                assert_eq!(provider.as_deref(), Some("acme/plugin"));
+                assert_eq!(engine.as_deref(), Some("endpoint-prod"));
+            }
+            other => panic!("expected one plugin route selection, got {other:?}"),
+        }
+        assert_payload_free(&events);
+    }
+
+    #[test]
+    fn plugin_route_failure_records_failed_attempt_and_terminal_outcome() {
+        let (service, mut attachment) = plugin_lifecycle();
+        let observer = attachment.route_observer();
+        let result = record_plugin_attempt(
+            observer,
+            "plugin-model",
+            "plugin.example",
+            "sk_test",
+            super::super::response::RouteAttemptResult::RetryableUnavailable,
+        );
+        assert_eq!(
+            result,
+            super::super::response::RouteAttemptResult::RetryableUnavailable
+        );
+
+        attachment.terminal(terminal_outcome_for_plugin_route(Some(
+            PluginRouteOutcome::Failed("plugin_endpoint_failed"),
+        )));
+        attachment.terminal(TerminalOutcome::Completed);
+
+        let events = recorded_lifecycle_events(&service);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, LifecycleEvent::AttemptStarted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, LifecycleEvent::AttemptFailed { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, LifecycleEvent::Failed { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, LifecycleEvent::Completed { .. }))
+                .count(),
+            0
+        );
+        match events
+            .iter()
+            .find(|event| matches!(event, LifecycleEvent::AttemptFailed { .. }))
+        {
+            Some(LifecycleEvent::AttemptFailed { error, .. }) => {
+                assert_eq!(error.as_deref(), Some("retryable_unavailable"));
+            }
+            other => panic!("expected one plugin attempt failure, got {other:?}"),
+        }
+        assert_payload_free(&events);
+    }
+
+    #[test]
+    fn plugin_route_without_endpoint_records_decision_without_attempt_or_payload() {
+        let (service, mut attachment) = plugin_lifecycle();
+        let observer = attachment.route_observer();
+        observer.route_selected_with_metadata(
+            Some("plugin-model"),
+            Some("plugin"),
+            Some("inference_endpoint"),
+        );
+        attachment.terminal(terminal_outcome_for_plugin_route(Some(
+            PluginRouteOutcome::Rejected("plugin_model_not_found"),
+        )));
+        attachment.terminal(TerminalOutcome::Failed("late_plugin_failure".into()));
+
+        let events = recorded_lifecycle_events(&service);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, LifecycleEvent::RouteSelected { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, LifecycleEvent::AttemptStarted { .. }))
+                .count(),
+            0
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, LifecycleEvent::Rejected { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, LifecycleEvent::Failed { .. }))
+                .count(),
+            0
+        );
+        assert_payload_free(&events);
     }
 }

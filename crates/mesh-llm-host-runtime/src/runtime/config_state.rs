@@ -15,6 +15,10 @@ use crate::plugin::{
 };
 use crate::protocol::convert::{canonical_config_hash, mesh_config_to_proto};
 
+use super::operational_logging::{
+    ConfigDiagnosticsOutcome, ConfigOperationalEvent, record_config_operational_event,
+};
+
 /// Mirrors the `ConfigApplyMode` proto enum; kept in the domain layer so
 /// `config_state` does not depend on the generated proto crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +175,10 @@ fn logging_changes_require_restart(old: &LoggingConfig, new: &LoggingConfig) -> 
             old.retention_ttl_secs != new.retention_ttl_secs,
         ),
         (
+            "retention_max_rows",
+            old.retention_max_rows != new.retention_max_rows,
+        ),
+        (
             "replay_capacity",
             old.replay_capacity != new.replay_capacity,
         ),
@@ -271,15 +279,20 @@ impl ConfigState {
     }
 
     pub(crate) fn apply(&mut self, new_config: MeshConfig, expected_revision: u64) -> ApplyResult {
+        record_config_operational_event(ConfigOperationalEvent::ApplyStarted);
         let raw_toml = config_to_toml(&new_config).ok();
         let diagnostics = validate_config_diagnostics_with_installed_plugin_schemas(
             &new_config,
             raw_toml.as_deref(),
         );
+        record_config_operational_event(ConfigOperationalEvent::Diagnostics(
+            ConfigDiagnosticsOutcome::from_diagnostics(&diagnostics),
+        ));
         if diagnostics
             .iter()
             .any(|diagnostic| diagnostic.severity == ConfigDiagnosticSeverity::Error)
         {
+            record_config_operational_event(ConfigOperationalEvent::ApplyRejected);
             return ApplyResult::ValidationError {
                 error: legacy_validation_error_text(&diagnostics),
                 diagnostics,
@@ -287,6 +300,7 @@ impl ConfigState {
         }
 
         if expected_revision != self.revision {
+            record_config_operational_event(ConfigOperationalEvent::ApplyRejected);
             return ApplyResult::RevisionConflict {
                 current_revision: self.revision,
             };
@@ -297,6 +311,7 @@ impl ConfigState {
         let new_write_hash = local_config_write_hash(&new_config);
 
         if new_write_hash == self.last_write_config_hash {
+            record_config_operational_event(ConfigOperationalEvent::ApplyAccepted);
             return ApplyResult::Applied {
                 revision: self.revision,
                 hash: self.config_hash,
@@ -306,6 +321,7 @@ impl ConfigState {
         }
 
         if let Err(e) = ConfigStore::open(self.config_path.clone()).save(&new_config) {
+            record_config_operational_event(ConfigOperationalEvent::ApplyRejected);
             return ApplyResult::PersistError(format!("failed to write config: {e}"));
         }
 
@@ -316,6 +332,7 @@ impl ConfigState {
             self.config_hash = new_hash;
             self.last_write_config_hash = new_write_hash;
             self.revision = new_revision;
+            record_config_operational_event(ConfigOperationalEvent::ApplyAccepted);
             return ApplyResult::PersistedWithRevisionTrackingError {
                 revision: self.revision,
                 hash: self.config_hash,
@@ -333,12 +350,14 @@ impl ConfigState {
         self.revision = new_revision;
 
         if logging_changes_require_restart(&old_logging, &self.config.logging) {
+            record_config_operational_event(ConfigOperationalEvent::ApplyAccepted);
             ApplyResult::AppliedWithRestartRequired {
                 revision: self.revision,
                 hash: self.config_hash,
                 diagnostics,
             }
         } else {
+            record_config_operational_event(ConfigOperationalEvent::ApplyAccepted);
             ApplyResult::Applied {
                 revision: self.revision,
                 hash: self.config_hash,
@@ -1642,7 +1661,7 @@ temperature = 0.2
     #[test]
     fn logging_change_classifier_requires_restart_for_every_static_setting() {
         let base = minimal_valid_config().logging;
-        let changes: [LoggingConfigChange; 15] = [
+        let changes: [LoggingConfigChange; 16] = [
             ("enabled", |config| config.enabled = !config.enabled),
             ("application_state_root", |config| {
                 config.application_state_root = Some(PathBuf::from("logging-state"));
@@ -1651,6 +1670,9 @@ temperature = 0.2
                 config.summary_line_limit += 1
             }),
             ("event_buffer_size", |config| config.event_buffer_size += 1),
+            ("retention_max_rows", |config| {
+                config.retention_max_rows += 1
+            }),
             ("queue_capacity", |config| config.queue_capacity += 1),
             ("artifact.capture_mode", |config| {
                 config.artifact.capture_mode = mesh_llm_config::CaptureMode::RedactedArtifacts;
@@ -1782,7 +1804,7 @@ temperature = 0.2
             other => panic!("expected Applied for baseline, got {other:?}"),
         }
 
-        let changes: [MeshConfigChange; 4] = [
+        let changes: [MeshConfigChange; 5] = [
             ("enabled", |config: &mut MeshConfig| {
                 config.logging.enabled = !config.logging.enabled;
             }),
@@ -1791,6 +1813,9 @@ temperature = 0.2
             }),
             ("cleanup_cadence_secs", |config: &mut MeshConfig| {
                 config.logging.cleanup_cadence_secs += 1;
+            }),
+            ("retention_max_rows", |config: &mut MeshConfig| {
+                config.logging.retention_max_rows += 1;
             }),
             ("artifact.capture_mode", |config: &mut MeshConfig| {
                 config.logging.artifact.capture_mode =

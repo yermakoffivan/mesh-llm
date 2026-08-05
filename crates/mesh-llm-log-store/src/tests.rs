@@ -1,6 +1,7 @@
 //! Acceptance tests for mesh-llm-log-store.
 //! All tests use real temp SQLite files (no in-memory shortcut).
 
+use std::collections::BTreeMap;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -8,7 +9,11 @@ use std::sync::{
 
 use super::cursor::{decode_cursor, encode_cursor};
 use super::error::LogStoreError;
-use super::migrations::CURRENT_VERSION;
+use super::migrations::{CURRENT_VERSION, apply_migrations};
+use super::repositories::{
+    WebhookDeliveryErrorCode, WebhookDeliveryInsertOutcome, WebhookDeliveryRecord,
+    WebhookDeliveryState, WebhookRetryOutcome,
+};
 use super::store::{Clock as ClockTrait, LogStore};
 
 /// Fixed clock returning deterministic ISO timestamps.
@@ -264,6 +269,256 @@ fn duplicate_terminal_write_returns_typed_conflict() {
 }
 
 #[test]
+fn duplicate_terminal_error_keeps_payload_out_of_the_error() {
+    let (store, clock, _tmp) = open_store();
+    let secret = "supersecret-terminal-payload";
+    store
+        .insert_summary(
+            "duplicate-safe",
+            None,
+            None,
+            None,
+            None,
+            &clock.now(),
+            None,
+            None,
+            None,
+        )
+        .expect("insert summary");
+    store
+        .write_terminal_event(
+            "duplicate-safe",
+            "first-terminal",
+            r#"{"type":"completed"}"#,
+            "completed",
+            &clock.now(),
+        )
+        .expect("first terminal");
+
+    let error = store
+        .write_terminal_event(
+            "duplicate-safe",
+            "second-terminal",
+            &format!(r#"{{"type":"failed","error":"{secret}"}}"#),
+            "failed",
+            &clock.now(),
+        )
+        .expect_err("duplicate terminal should fail");
+
+    assert!(matches!(
+        error,
+        LogStoreError::DuplicateTerminalEvent { ref event_type, .. } if event_type == "failed"
+    ));
+    assert!(!error.to_string().contains(secret));
+}
+
+#[test]
+fn terminal_detection_uses_the_typed_top_level_event_type() {
+    let (store, clock, _tmp) = open_store();
+    store
+        .insert_summary(
+            "typed-terminal",
+            None,
+            None,
+            None,
+            None,
+            &clock.now(),
+            None,
+            None,
+            None,
+        )
+        .expect("insert summary");
+
+    store
+        .insert_lifecycle_event(
+            "typed-terminal",
+            "nested-terminal-text",
+            r#"{"type":"admitted","context":{"type":"completed"}}"#,
+            &clock.now(),
+        )
+        .expect("nested terminal text is not terminal");
+    assert!(
+        !store
+            .has_terminal_event("typed-terminal")
+            .expect("terminal state")
+    );
+
+    store
+        .insert_lifecycle_event(
+            "typed-terminal",
+            "actual-terminal",
+            r#"{"type":"completed"}"#,
+            &clock.now(),
+        )
+        .expect("actual terminal event");
+    assert!(
+        store
+            .has_terminal_event("typed-terminal")
+            .expect("terminal state")
+    );
+}
+
+#[test]
+fn v8_migration_backfills_typed_terminal_columns_and_index() {
+    let connection = rusqlite::Connection::open_in_memory().expect("open legacy database");
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE lifecycle_events (
+                event_id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE UNIQUE INDEX idx_terminal_event_one_per_request
+            ON lifecycle_events (request_id)
+            WHERE payload_json LIKE '%"type":"completed"%';
+            INSERT INTO lifecycle_events VALUES
+                ('legacy-terminal', 'request-terminal', '2025-01-01T00:00:00Z', '{"type":"completed"}'),
+                ('legacy-active', 'request-active', '2025-01-01T00:00:01Z', '{"type":"admitted"}');
+            PRAGMA user_version = 7;
+            "#,
+        )
+        .expect("seed v7 lifecycle table");
+    seed_v7_maintenance_schema(&connection);
+
+    apply_migrations(&connection).expect("migrate v7 lifecycle table");
+    let terminal: (String, i64) = connection
+        .query_row(
+            "SELECT event_type, is_terminal FROM lifecycle_events WHERE event_id = 'legacy-terminal'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read terminal backfill");
+    let active: (String, i64) = connection
+        .query_row(
+            "SELECT event_type, is_terminal FROM lifecycle_events WHERE event_id = 'legacy-active'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("read active backfill");
+
+    assert_eq!(terminal, ("completed".to_string(), 1));
+    assert_eq!(active, ("admitted".to_string(), 0));
+    assert!(connection
+        .execute(
+            "INSERT INTO lifecycle_events \
+             (event_id, request_id, occurred_at, payload_json, event_type, is_terminal) \
+             VALUES ('duplicate-terminal', 'request-terminal', '2025-01-01T00:00:02Z', '{}', 'failed', 1)",
+            [],
+        )
+        .is_err());
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
+            .expect("read migrated schema version"),
+        CURRENT_VERSION as i32
+    );
+    let maintenance_columns: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('maintenance_operations') \
+             WHERE name IN ( \
+                'selection_fingerprint', \
+                'artifact_files_removed', \
+                'artifact_files_failed', \
+                'artifact_file_failure_class', \
+                'preview_audit_id', \
+                'execution_audit_id', \
+                'cleanup_filters_json' \
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("inspect migrated maintenance schema");
+    assert_eq!(maintenance_columns, 7);
+}
+
+#[test]
+fn failed_v8_migration_rolls_back_terminal_columns_and_schema_version() {
+    let connection = rusqlite::Connection::open_in_memory().expect("open legacy database");
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE lifecycle_events (
+                event_id TEXT PRIMARY KEY,
+                request_id TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}'
+            );
+            INSERT INTO lifecycle_events VALUES
+                ('first-terminal', 'request-terminal', '2025-01-01T00:00:00Z', '{"type":"completed"}'),
+                ('second-terminal', 'request-terminal', '2025-01-01T00:00:01Z', '{"type":"failed"}');
+            PRAGMA user_version = 7;
+            "#,
+        )
+        .expect("seed v7 lifecycle table with terminal conflict");
+    seed_v7_maintenance_schema(&connection);
+
+    assert!(apply_migrations(&connection).is_err());
+    let version: i32 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("read schema version after failed migration");
+    assert_eq!(version, 7);
+    let has_terminal_columns: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('lifecycle_events') \
+             WHERE name IN ('event_type', 'is_terminal')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("inspect rolled back lifecycle table");
+    assert_eq!(has_terminal_columns, 0);
+}
+
+/// A database marked v7 has the maintenance schema introduced in v4 and
+/// extended in v5 and v6. Lifecycle-only fixtures still need that historical
+/// prerequisite before they exercise later migrations.
+fn seed_v7_maintenance_schema(connection: &rusqlite::Connection) {
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE maintenance_operations (
+                operation_id TEXT PRIMARY KEY,
+                action TEXT NOT NULL,
+                cutoff_before TEXT NOT NULL,
+                request_limit INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                state TEXT NOT NULL,
+                planned_requests INTEGER NOT NULL,
+                planned_events INTEGER NOT NULL,
+                planned_artifacts INTEGER NOT NULL,
+                planned_proxy_records INTEGER NOT NULL,
+                planned_database_rows INTEGER NOT NULL,
+                executed_requests INTEGER NOT NULL DEFAULT 0,
+                executed_events INTEGER NOT NULL DEFAULT 0,
+                executed_artifacts INTEGER NOT NULL DEFAULT 0,
+                executed_proxy_records INTEGER NOT NULL DEFAULT 0,
+                executed_database_rows INTEGER NOT NULL DEFAULT 0,
+                has_more INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                selection_fingerprint TEXT NOT NULL DEFAULT '',
+                artifact_files_removed INTEGER NOT NULL DEFAULT 0,
+                artifact_files_failed INTEGER NOT NULL DEFAULT 0,
+                artifact_file_failure_class TEXT
+            );
+
+            CREATE TABLE maintenance_operation_targets (
+                operation_id TEXT NOT NULL REFERENCES maintenance_operations(operation_id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL,
+                request_id TEXT NOT NULL,
+                PRIMARY KEY (operation_id, request_id),
+                UNIQUE (operation_id, ordinal)
+            );
+
+            CREATE INDEX idx_maintenance_operation_targets_operation
+            ON maintenance_operation_targets (operation_id, ordinal);
+            "#,
+        )
+        .expect("seed v7 maintenance schema");
+}
+
+#[test]
 fn duplicate_non_terminal_same_type_events_allowed() {
     let (store, clock, _tmp) = open_store();
 
@@ -352,6 +607,66 @@ fn cursor_pages_no_overlap_or_omission() {
     for i in 0..7u32 {
         assert!(all_ids.iter().any(|id| id == &format!("page-{:04}", i)));
     }
+}
+
+#[test]
+fn opaque_keyset_cursor_respects_boundaries_and_limits_for_summaries_and_events() {
+    let (store, _clock, _tmp) = open_store();
+    for (request_id, created_at) in [
+        ("page-a", "2025-01-01T00:00:01Z"),
+        ("page-b", "2025-01-01T00:00:02Z"),
+        ("page-c", "2025-01-01T00:00:03Z"),
+    ] {
+        store
+            .insert_summary(
+                request_id, None, None, None, None, created_at, None, None, None,
+            )
+            .expect("insert summary");
+    }
+    for (event_id, occurred_at) in [
+        ("event-a", "2025-01-01T00:00:01Z"),
+        ("event-b", "2025-01-01T00:00:02Z"),
+        ("event-c", "2025-01-01T00:00:03Z"),
+    ] {
+        store
+            .insert_lifecycle_event("page-a", event_id, r#"{"type":"admitted"}"#, occurred_at)
+            .expect("insert lifecycle event");
+    }
+
+    let first_summaries = store.list_summaries(1, None).expect("first summaries page");
+    assert_eq!(first_summaries.items[0].request_id, "page-c");
+    let second_summaries = store
+        .list_summaries(1, first_summaries.next_cursor.as_deref())
+        .expect("second summaries page");
+    assert_eq!(second_summaries.items[0].request_id, "page-b");
+
+    let first_events = store
+        .list_lifecycle_events(1, None)
+        .expect("first lifecycle page");
+    assert_eq!(first_events.items[0].event_id, "event-c");
+    let second_events = store
+        .list_lifecycle_events(1, first_events.next_cursor.as_deref())
+        .expect("second lifecycle page");
+    assert_eq!(second_events.items[0].event_id, "event-b");
+
+    assert!(
+        store
+            .list_summaries(0, None)
+            .expect("zero summary limit")
+            .items
+            .is_empty()
+    );
+    assert!(
+        store
+            .list_lifecycle_events(0, None)
+            .expect("zero lifecycle limit")
+            .items
+            .is_empty()
+    );
+    assert!(matches!(
+        store.list_summaries(1, Some("not-an-opaque-cursor")),
+        Err(LogStoreError::CursorMalformed(_))
+    ));
 }
 
 #[test]
@@ -509,9 +824,11 @@ fn cascade_cleanup_removes_by_cutoff() {
         store
             .conn()
             .execute(
-                "INSERT INTO summaries (request_id, state, created_at) VALUES (?, 'active', ?)",
+                "INSERT INTO summaries (request_id, state, created_at, terminal_at)\n\
+                 VALUES (?, 'completed', ?, ?)",
                 rusqlite::params![
                     format!("cleanup-summ-{:04}", i),
+                    format!("2025-{:02}-15T00:00:00Z", month),
                     format!("2025-{:02}-15T00:00:00Z", month)
                 ],
             )
@@ -564,42 +881,15 @@ fn cascade_cleanup_removes_by_cutoff() {
     let proxy_count = store.count_table("proxy_records").unwrap();
     assert_eq!(proxy_count, 3, "only Mar/Apr/May proxy records remain");
 
-    // Summaries: Jan/Feb summaries deleted (orphaned — no remaining lifecycle_events).
-    // Mar/Apr/May summaries survive.
+    // Terminal Jan/Feb summaries cascade with their owned detail; Mar/Apr/May survive.
     let summ_count = store.count_table("summaries").unwrap();
     assert_eq!(summ_count, 3, "only Mar/Apr/May summaries remain");
 
-    // Audit + webhook rows SURVIVE via ON DELETE SET NULL (request_id becomes NULL).
     let audit_count = store.count_table("audit_entries").unwrap();
-    assert_eq!(
-        audit_count, 5,
-        "all audit entries survive with request_id=NULL for deleted summaries"
-    );
+    assert_eq!(audit_count, 3, "old audit rows follow their TTL policy");
 
     let wh_count = store.count_table("webhook_deliveries").unwrap();
-    assert_eq!(
-        wh_count, 5,
-        "all webhook deliveries survive with request_id=NULL for deleted summaries"
-    );
-
-    // Verify Jan/Feb audit/webhook rows have NULL request_id.
-    let null_audits: i64 = store.conn().query_row(
-        "SELECT COUNT(*) FROM audit_entries WHERE occurred_at < '2025-03-01T00:00:00Z' AND request_id IS NULL",
-        [], |row| row.get::<_, i64>(0),
-    ).unwrap();
-    assert_eq!(
-        null_audits, 2,
-        "Jan/Feb audit entries have NULL request_id after cascade"
-    );
-
-    let null_wh: i64 = store.conn().query_row(
-        "SELECT COUNT(*) FROM webhook_deliveries WHERE occurred_at < '2025-03-01T00:00:00Z' AND request_id IS NULL",
-        [], |row| row.get::<_, i64>(0),
-    ).unwrap();
-    assert_eq!(
-        null_wh, 2,
-        "Jan/Feb webhook deliveries have NULL request_id after cascade"
-    );
+    assert_eq!(wh_count, 3, "old webhook rows follow their TTL policy");
 
     // Verify Mar/Apr/May audit/webhook rows still reference their summaries.
     let non_null_audits: i64 = store.conn().query_row(
@@ -960,50 +1250,237 @@ fn webhook_delivery_insert_and_count() {
         )
         .unwrap();
     store
-        .insert_webhook_delivery(
-            "wh-1",
-            Some("req-1"),
-            &clock.now(),
-            "https://example.com/hook",
-            1,
-            Some(200),
-            Some(r#"{"ok":true}"#),
-            None,
-        )
+        .insert_webhook_delivery("wh-1", Some("req-1"), &clock.now(), 1, Some(200))
         .expect("insert webhook delivery");
 
     assert_eq!(store.count_table("webhook_deliveries").unwrap(), 1);
 
     // Duplicate PK fails.
     let err = store
-        .insert_webhook_delivery(
-            "wh-1",
-            Some("req-1"),
-            &clock.now(),
-            "https://other.com/hook",
-            2,
-            None,
-            None,
-            None,
-        )
+        .insert_webhook_delivery("wh-1", Some("req-1"), &clock.now(), 2, None)
         .unwrap_err();
     assert!(matches!(err, LogStoreError::AlreadyExists { .. }));
 
     // Without request_id.
     store
-        .insert_webhook_delivery(
-            "wh-2",
-            None,
-            &clock.now(),
-            "https://standalone.com/hook",
-            1,
-            Some(500),
-            None,
-            Some("connection refused"),
-        )
+        .insert_webhook_delivery("wh-2", None, &clock.now(), 1, Some(500))
         .expect("insert webhook without request_id");
 
     assert_eq!(store.count_table("webhook_deliveries").unwrap(), 2);
+}
+
+#[test]
+fn webhook_delivery_state_machine_is_idempotent_fenced_and_restart_safe() {
+    let (store, clock, _tmp) = open_store();
+    let created_at = "2026-08-04T12:00:00Z";
+    seed_terminal_webhook_request(&store, created_at);
+    assert_enqueue_requires_terminal_event(&store, created_at);
+    enqueue_webhook_delivery_idempotently(&store, created_at);
+    let first = claim_initial_webhook_delivery(&store);
+    let second = retry_and_claim_webhook_delivery(&store, first.claim_generation);
+    let manual = dead_letter_and_claim_manual_retry(&store, second.claim_generation);
+    complete_webhook_delivery_with_fencing(
+        &store,
+        manual.claim_generation,
+        second.claim_generation,
+    );
+    assert_webhook_delivery_is_private_and_restart_safe(&store, clock);
+}
+
+fn seed_terminal_webhook_request(store: &LogStore, created_at: &str) {
+    store
+        .insert_summary(
+            "request-terminal",
+            None,
+            None,
+            None,
+            None,
+            created_at,
+            None,
+            None,
+            None,
+        )
+        .expect("insert terminal summary owner");
+}
+
+fn assert_enqueue_requires_terminal_event(store: &LogStore, created_at: &str) {
+    assert!(matches!(
+        store.enqueue_webhook_delivery("before-terminal", "request-terminal", created_at, 2),
+        Err(LogStoreError::InvalidQuery(message)) if message.contains("durable terminal event")
+    ));
+    store
+        .write_terminal_event(
+            "request-terminal",
+            "event-terminal",
+            r#"{"type":"completed"}"#,
+            "completed",
+            created_at,
+        )
+        .expect("commit terminal before webhook enqueue");
+}
+
+fn enqueue_webhook_delivery_idempotently(store: &LogStore, created_at: &str) {
+    let created = store
+        .enqueue_webhook_delivery("delivery-terminal", "request-terminal", created_at, 2)
+        .expect("enqueue terminal webhook");
+    assert!(matches!(
+        created,
+        WebhookDeliveryInsertOutcome::Created(WebhookDeliveryRecord {
+            state: WebhookDeliveryState::Pending,
+            attempt_number: 0,
+            max_attempts: 2,
+            ..
+        })
+    ));
+    assert!(matches!(
+        store
+            .enqueue_webhook_delivery("delivery-terminal", "request-terminal", created_at, 2)
+            .expect("idempotent enqueue"),
+        WebhookDeliveryInsertOutcome::Existing(_)
+    ));
+}
+
+fn claim_initial_webhook_delivery(store: &LogStore) -> WebhookDeliveryRecord {
+    let first = store
+        .claim_next_webhook_delivery("2026-08-04T12:00:01Z", "2026-08-04T12:01:01Z")
+        .expect("claim first attempt")
+        .expect("pending delivery is claimable");
+    assert_eq!(first.state, WebhookDeliveryState::InFlight);
+    assert_eq!(first.attempt_number, 1);
+    assert_eq!(first.claim_generation, 1);
+    assert!(
+        store
+            .claim_next_webhook_delivery("2026-08-04T12:00:02Z", "2026-08-04T12:01:02Z")
+            .expect("second claim")
+            .is_none(),
+        "an active lease excludes duplicate worker wakeups"
+    );
+    first
+}
+
+fn retry_and_claim_webhook_delivery(
+    store: &LogStore,
+    claim_generation: u64,
+) -> WebhookDeliveryRecord {
+    assert_eq!(
+        store
+            .retry_or_dead_letter_webhook_delivery(
+                "delivery-terminal",
+                claim_generation,
+                "2026-08-04T12:00:03Z",
+                "2026-08-04T12:00:10Z",
+                WebhookDeliveryErrorCode::Timeout,
+            )
+            .expect("schedule retry"),
+        Some(WebhookRetryOutcome::RetryScheduled)
+    );
+    assert!(
+        store
+            .claim_next_webhook_delivery("2026-08-04T12:00:09Z", "2026-08-04T12:01:09Z")
+            .expect("claim before retry")
+            .is_none()
+    );
+
+    let second = store
+        .claim_next_webhook_delivery("2026-08-04T12:00:10Z", "2026-08-04T12:01:10Z")
+        .expect("claim retry")
+        .expect("retry is eligible");
+    assert_eq!(second.attempt_number, 2);
+    second
+}
+
+fn dead_letter_and_claim_manual_retry(
+    store: &LogStore,
+    claim_generation: u64,
+) -> WebhookDeliveryRecord {
+    assert_eq!(
+        store
+            .retry_or_dead_letter_webhook_delivery(
+                "delivery-terminal",
+                claim_generation,
+                "2026-08-04T12:00:11Z",
+                "2026-08-04T12:00:20Z",
+                WebhookDeliveryErrorCode::Http5xx,
+            )
+            .expect("dead-letter exhausted delivery"),
+        Some(WebhookRetryOutcome::DeadLettered)
+    );
+    assert!(
+        store
+            .manually_retry_webhook_delivery("delivery-terminal", "2026-08-04T12:00:12Z")
+            .expect("manual retry dead letter")
+    );
+
+    let manual = store
+        .claim_next_webhook_delivery("2026-08-04T12:00:12Z", "2026-08-04T12:01:12Z")
+        .expect("claim manual retry")
+        .expect("manual retry is eligible");
+    assert_eq!(manual.state, WebhookDeliveryState::InFlight);
+    assert_eq!(manual.attempt_number, 1);
+    assert_eq!(manual.claim_generation, 3);
+    manual
+}
+
+fn complete_webhook_delivery_with_fencing(
+    store: &LogStore,
+    winning_claim_generation: u64,
+    stale_claim_generation: u64,
+) {
+    assert!(
+        store
+            .complete_webhook_delivery(
+                "delivery-terminal",
+                winning_claim_generation,
+                "2026-08-04T12:00:13Z",
+                204,
+            )
+            .expect("complete fenced delivery")
+    );
+    assert!(
+        !store
+            .complete_webhook_delivery(
+                "delivery-terminal",
+                stale_claim_generation,
+                "2026-08-04T12:00:14Z",
+                204,
+            )
+            .expect("stale completion is harmless"),
+        "a displaced worker cannot overwrite the fenced completion"
+    );
+}
+
+fn assert_webhook_delivery_is_private_and_restart_safe(
+    store: &LogStore,
+    clock: Arc<dyn ClockTrait>,
+) {
+    let record = store
+        .webhook_delivery("delivery-terminal")
+        .expect("load delivery")
+        .expect("delivery persisted");
+    assert_eq!(record.state, WebhookDeliveryState::Succeeded);
+    assert_eq!(record.status_code, Some(204));
+    assert_eq!(record.last_error_code, None);
+    let (target, body, error): (String, Option<String>, Option<String>) = store
+        .conn()
+        .query_row(
+            "SELECT target_url, response_body, error_msg FROM webhook_deliveries WHERE delivery_id = ?",
+            ["delivery-terminal"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("inspect privacy-safe storage");
+    assert_eq!(target, "configured_webhook");
+    assert!(body.is_none());
+    assert!(error.is_none());
+
+    let reopened = store.reopen(clock).expect("reopen webhook database");
+    assert_eq!(
+        reopened
+            .webhook_delivery("delivery-terminal")
+            .expect("load after restart")
+            .expect("record after restart")
+            .state,
+        WebhookDeliveryState::Succeeded
+    );
 }
 
 #[test]
@@ -1141,4 +1618,553 @@ fn list_events_for_summary_ordered_chronologically() {
     assert_eq!(events[0].event_id, "evt-a");
     assert_eq!(events[1].event_id, "evt-b");
     assert_eq!(events[2].event_id, "evt-c");
+}
+
+#[test]
+fn max_row_prune_is_deterministic_preserves_active_and_returns_owned_artifact_pointers() {
+    let (store, _, _tmp) = open_store();
+    for request_id in ["active", "tie-a", "tie-b", "newest"] {
+        store
+            .insert_summary(
+                request_id,
+                None,
+                None,
+                None,
+                None,
+                "2025-01-01T00:00:00Z",
+                None,
+                None,
+                None,
+            )
+            .expect("insert summary");
+    }
+    for request_id in ["tie-a", "tie-b"] {
+        store
+            .write_terminal_event(
+                request_id,
+                &format!("event-{request_id}"),
+                r#"{"type":"completed"}"#,
+                "completed",
+                "2025-02-01T00:00:00Z",
+            )
+            .expect("write terminal event");
+    }
+    store
+        .write_terminal_event(
+            "newest",
+            "event-newest",
+            r#"{"type":"completed"}"#,
+            "completed",
+            "2025-03-01T00:00:00Z",
+        )
+        .expect("write newest terminal event");
+    store
+        .insert_artifact_pointer(
+            "artifact-tie-a",
+            "tie-a",
+            "2025-02-01T00:00:00Z",
+            "request_body",
+            None,
+        )
+        .expect("insert pointer");
+
+    let (deleted, pointers) = store
+        .cascade_prune_terminal_summaries_to_max_rows(2)
+        .expect("prune terminal history");
+    assert_eq!(deleted, 3, "summary, terminal event, and pointer");
+    assert_eq!(
+        pointers,
+        vec![super::repositories::CascadeArtifactPointer {
+            artifact_id: "artifact-tie-a".to_string(),
+            request_id: "tie-a".to_string(),
+        }]
+    );
+    assert!(store.get_summary("active").unwrap().is_some());
+    assert!(store.get_summary("tie-a").unwrap().is_none());
+    assert!(store.get_summary("tie-b").unwrap().is_some());
+    assert!(store.get_summary("newest").unwrap().is_some());
+    assert_eq!(store.count_table("artifact_pointers").unwrap(), 0);
+}
+
+#[test]
+fn max_row_prune_is_idempotent_after_retention_is_satisfied() {
+    let (store, _, _tmp) = open_store();
+    store
+        .insert_summary(
+            "completed",
+            None,
+            None,
+            None,
+            None,
+            "2025-01-01T00:00:00Z",
+            None,
+            None,
+            None,
+        )
+        .expect("insert summary");
+    store
+        .write_terminal_event(
+            "completed",
+            "event-completed",
+            r#"{"type":"completed"}"#,
+            "completed",
+            "2025-01-01T00:00:01Z",
+        )
+        .expect("write terminal event");
+
+    assert_eq!(
+        store
+            .cascade_prune_terminal_summaries_to_max_rows(1)
+            .expect("initial no-op"),
+        (0, Vec::new())
+    );
+}
+
+#[test]
+fn max_row_prune_survives_store_restart_with_the_retained_summaries_intact() {
+    let (store, clock, tmp) = open_store();
+    for (request_id, occurred_at) in [
+        ("oldest", "2025-01-01T00:00:01Z"),
+        ("newer", "2025-01-01T00:00:02Z"),
+    ] {
+        store
+            .insert_summary(
+                request_id,
+                None,
+                None,
+                None,
+                None,
+                occurred_at,
+                None,
+                None,
+                None,
+            )
+            .expect("insert summary");
+        store
+            .write_terminal_event(
+                request_id,
+                &format!("event-{request_id}"),
+                r#"{"type":"completed"}"#,
+                "completed",
+                occurred_at,
+            )
+            .expect("write terminal");
+    }
+    store
+        .cascade_prune_terminal_summaries_to_max_rows(1)
+        .expect("prune before restart");
+    drop(store);
+
+    let reopened = LogStore::reopen_at(tmp.path(), clock).expect("reopen store");
+    assert!(reopened.get_summary("oldest").unwrap().is_none());
+    assert!(reopened.get_summary("newer").unwrap().is_some());
+    assert_eq!(
+        reopened
+            .cascade_prune_terminal_summaries_to_max_rows(1)
+            .expect("idempotent after restart"),
+        (0, Vec::new())
+    );
+}
+
+#[test]
+fn retention_policy_uses_summary_ownership_and_per_table_ttl_after_reopen() {
+    let (store, clock, tmp) = open_store();
+    let old = "2025-01-01T00:00:00Z";
+    let fresh = "2025-03-01T00:00:00Z";
+    let cutoff = "2025-02-01T00:00:00Z";
+
+    for request_id in ["expired-terminal", "retained-terminal", "active"] {
+        store
+            .insert_summary(request_id, None, None, None, None, old, None, None, None)
+            .expect("insert summary");
+    }
+    store
+        .write_terminal_event(
+            "expired-terminal",
+            "expired-terminal-event",
+            r#"{"type":"completed"}"#,
+            "completed",
+            old,
+        )
+        .expect("write expired terminal");
+    store
+        .write_terminal_event(
+            "retained-terminal",
+            "retained-terminal-event",
+            r#"{"type":"completed"}"#,
+            "completed",
+            fresh,
+        )
+        .expect("write retained terminal");
+    store
+        .conn()
+        .execute(
+            "INSERT INTO lifecycle_events (event_id, request_id, occurred_at, payload_json)\n\
+             VALUES ('retained-old-event', 'retained-terminal', ?1, '{\"type\":\"chunk\"}')",
+            rusqlite::params![old],
+        )
+        .expect("insert retained old event");
+    store
+        .insert_proxy_record(
+            "expired-proxy",
+            "expired-terminal",
+            old,
+            "target",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("insert expired proxy");
+    store
+        .insert_proxy_record(
+            "retained-proxy",
+            "retained-terminal",
+            old,
+            "target",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("insert retained proxy");
+    store
+        .insert_artifact_pointer("expired-artifact", "expired-terminal", old, "request", None)
+        .expect("insert expired pointer");
+    store
+        .insert_artifact_pointer("active-artifact", "active", old, "request", None)
+        .expect("insert active pointer");
+    store
+        .insert_audit_entry("old-audit", None, old, "operator", "test", None)
+        .expect("insert audit");
+    store
+        .insert_webhook_delivery("old-webhook", None, old, 1, None)
+        .expect("insert webhook");
+    store
+        .insert_cleanup_run("old-cleanup", old, "test", cutoff, 0, None)
+        .expect("insert cleanup run");
+
+    let result = store
+        .apply_retention_policy(cutoff, 100)
+        .expect("apply retention");
+    assert_eq!(result.ttl_deleted_count, 11);
+    assert_eq!(result.max_rows_deleted_count, 0);
+    assert_eq!(
+        result.artifact_pointers,
+        vec![super::repositories::CascadeArtifactPointer {
+            artifact_id: "expired-artifact".to_string(),
+            request_id: "expired-terminal".to_string(),
+        }]
+    );
+    assert!(store.get_summary("expired-terminal").unwrap().is_none());
+    assert!(store.get_summary("retained-terminal").unwrap().is_none());
+    assert!(store.get_summary("active").unwrap().is_some());
+    assert!(
+        store
+            .get_artifact_pointer("active-artifact")
+            .unwrap()
+            .is_some()
+    );
+    assert!(result.table_results.iter().all(|entry| {
+        matches!(
+            entry.table,
+            super::repositories::RetentionTable::Summaries
+                | super::repositories::RetentionTable::LifecycleEvents
+                | super::repositories::RetentionTable::ArtifactPointers
+                | super::repositories::RetentionTable::ProxyRecords
+                | super::repositories::RetentionTable::AuditEntries
+                | super::repositories::RetentionTable::WebhookDeliveries
+                | super::repositories::RetentionTable::CleanupRuns
+        )
+    }));
+    assert_eq!(store.count_table("proxy_records").unwrap(), 0);
+    assert_eq!(store.count_table("audit_entries").unwrap(), 0);
+    assert_eq!(store.count_table("webhook_deliveries").unwrap(), 0);
+    assert_eq!(store.count_table("cleanup_runs").unwrap(), 0);
+
+    drop(store);
+    let reopened = LogStore::reopen_at(tmp.path(), clock).expect("reopen store");
+    assert_eq!(
+        reopened
+            .apply_retention_policy(cutoff, 100)
+            .expect("idempotent retention after reopen"),
+        super::repositories::RetentionCleanupResult {
+            ttl_deleted_count: 0,
+            max_rows_deleted_count: 0,
+            artifact_pointers: Vec::new(),
+            table_results: super::repositories::RetentionTable::ALL
+                .into_iter()
+                .map(|table| super::repositories::RetentionTableResult {
+                    table,
+                    ttl_deleted_count: 0,
+                    max_rows_deleted_count: 0,
+                })
+                .collect(),
+        }
+    );
+}
+
+#[test]
+fn webhook_dead_letter_retention_uses_transition_time_and_preserves_generic_policy() {
+    use super::repositories::{RetentionPolicy, RetentionTable};
+
+    let (store, clock, tmp) = open_store();
+    let generic_cutoff = "2025-01-01T00:00:00Z";
+    let generic_cleanup_cutoff = "2025-03-01T00:00:00Z";
+    let dead_letter_cutoff = "2025-04-01T00:00:00Z";
+    let occurred_at = "2025-02-01T00:00:00Z";
+    let insert = |delivery_id: &str, state: &str, updated_at: &str| {
+        store
+            .conn()
+            .execute(
+                r#"
+                INSERT INTO webhook_deliveries
+                    (delivery_id, request_id, occurred_at, target_url, attempt_number, response_body, error_msg,
+                     state, created_at, updated_at, next_attempt_at, lease_expires_at, claim_generation, max_attempts, last_error_code)
+                VALUES (?1, NULL, ?2, 'configured_webhook', 1, NULL, NULL, ?3, ?2, ?4, NULL, NULL, 0, 3, NULL)
+                "#,
+                rusqlite::params![delivery_id, occurred_at, state, updated_at],
+            )
+            .expect("insert webhook delivery");
+    };
+    insert("expired-dead-letter", "dead_letter", "2025-03-31T23:59:59Z");
+    insert("fresh-dead-letter", "dead_letter", "2025-04-01T00:00:00Z");
+    for (delivery_id, state) in [
+        ("pending-delivery", "pending"),
+        ("retry-delivery", "retry"),
+        ("in-flight-delivery", "in_flight"),
+        ("manual-retry-delivery", "manual_retry"),
+        ("succeeded-delivery", "succeeded"),
+    ] {
+        insert(delivery_id, state, "2025-03-31T23:59:59Z");
+    }
+
+    let policy = RetentionPolicy::uniform(generic_cutoff, 100)
+        .expect("generic retention policy")
+        .with_webhook_dead_letter_cutoff(dead_letter_cutoff);
+    let result = store
+        .apply_retention_policy_map(&policy)
+        .expect("dead-letter retention");
+    assert_eq!(result.ttl_deleted_count, 1);
+    assert_eq!(
+        result
+            .table_results
+            .iter()
+            .find(|entry| entry.table == RetentionTable::WebhookDeliveries)
+            .expect("webhook table result")
+            .ttl_deleted_count,
+        1
+    );
+    assert!(
+        store
+            .webhook_delivery("expired-dead-letter")
+            .expect("expired lookup")
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .webhook_delivery("fresh-dead-letter")
+            .expect("fresh lookup")
+            .expect("fresh dead letter retained")
+            .state,
+        WebhookDeliveryState::DeadLetter
+    );
+    for (delivery_id, expected_state) in [
+        ("pending-delivery", WebhookDeliveryState::Pending),
+        ("retry-delivery", WebhookDeliveryState::Retry),
+        ("in-flight-delivery", WebhookDeliveryState::InFlight),
+        ("manual-retry-delivery", WebhookDeliveryState::ManualRetry),
+        ("succeeded-delivery", WebhookDeliveryState::Succeeded),
+    ] {
+        assert_eq!(
+            store
+                .webhook_delivery(delivery_id)
+                .expect("non-dead-letter lookup")
+                .expect("non-dead-letter retained")
+                .state,
+            expected_state,
+            "{delivery_id} must not use the dead-letter window"
+        );
+    }
+
+    drop(store);
+    let reopened = LogStore::reopen_at(tmp.path(), clock).expect("reopen store");
+    assert_eq!(
+        reopened
+            .apply_retention_policy_map(&policy)
+            .expect("idempotent dead-letter retention")
+            .ttl_deleted_count,
+        0
+    );
+    let generic_result = reopened
+        .apply_retention_policy_map(
+            &RetentionPolicy::uniform(generic_cleanup_cutoff, 100)
+                .expect("generic retention policy"),
+        )
+        .expect("generic webhook retention remains available");
+    assert_eq!(generic_result.ttl_deleted_count, 6);
+    assert_eq!(
+        reopened
+            .count_table("webhook_deliveries")
+            .expect("count webhooks"),
+        0
+    );
+}
+
+#[test]
+fn per_table_retention_caps_are_deterministic_owner_safe_and_restart_safe() {
+    use super::repositories::{RetentionPolicy, RetentionTable, RetentionTablePolicy};
+
+    let (store, clock, tmp) = open_store();
+    let fresh = "2025-03-01T00:00:00Z";
+    for request_id in ["active", "tie-a", "tie-b"] {
+        store
+            .insert_summary(request_id, None, None, None, None, fresh, None, None, None)
+            .expect("insert summary");
+    }
+    for request_id in ["tie-a", "tie-b"] {
+        store
+            .write_terminal_event(
+                request_id,
+                &format!("terminal-{request_id}"),
+                r#"{"type":"completed"}"#,
+                "completed",
+                fresh,
+            )
+            .expect("terminal event");
+        store
+            .insert_artifact_pointer(
+                &format!("artifact-{request_id}"),
+                request_id,
+                fresh,
+                "request",
+                None,
+            )
+            .expect("owned pointer");
+        store
+            .insert_proxy_record(
+                &format!("proxy-{request_id}"),
+                request_id,
+                fresh,
+                "target",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("owned proxy");
+    }
+    store
+        .insert_artifact_pointer("artifact-active", "active", fresh, "request", None)
+        .expect("active pointer");
+    for index in 0..2 {
+        let id = index.to_string();
+        store
+            .insert_audit_entry(
+                &format!("audit-{id}"),
+                None,
+                fresh,
+                "operator",
+                "retention-test",
+                None,
+            )
+            .expect("audit");
+        store
+            .insert_webhook_delivery(&format!("webhook-{id}"), None, fresh, 1, None)
+            .expect("webhook");
+        store
+            .insert_cleanup_run(&format!("run-{id}"), fresh, "test", fresh, 0, None)
+            .expect("cleanup receipt");
+    }
+
+    let table_policies = RetentionTable::ALL
+        .into_iter()
+        .map(|table| {
+            (
+                table,
+                RetentionTablePolicy {
+                    cutoff_occurred_at: "2025-01-01T00:00:00Z".to_string(),
+                    max_rows: if table == RetentionTable::Summaries {
+                        2
+                    } else {
+                        1
+                    },
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let result = store
+        .apply_retention_policy_map(&RetentionPolicy::new(table_policies).expect("complete map"))
+        .expect("per-table retention");
+
+    // Same-time owner selection is deterministic by ID: the pointer cap picks
+    // tie-a first, while active rows and their artifact remain protected.
+    assert!(store.get_summary("tie-a").unwrap().is_none());
+    assert!(store.get_summary("active").unwrap().is_some());
+    assert!(
+        store
+            .get_artifact_pointer("artifact-active")
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(store.count_table("audit_entries").unwrap(), 1);
+    assert_eq!(store.count_table("webhook_deliveries").unwrap(), 1);
+    assert_eq!(store.count_table("cleanup_runs").unwrap(), 1);
+    assert!(
+        result
+            .table_results
+            .iter()
+            .all(|entry| RetentionTable::ALL.contains(&entry.table))
+    );
+    assert!(
+        result
+            .table_results
+            .iter()
+            .any(|entry| entry.table == RetentionTable::ArtifactPointers
+                && entry.max_rows_deleted_count > 0)
+    );
+
+    drop(store);
+    let reopened = LogStore::reopen_at(tmp.path(), clock).expect("reopen");
+    assert!(reopened.get_summary("active").unwrap().is_some());
+    assert!(
+        reopened
+            .get_artifact_pointer("artifact-active")
+            .unwrap()
+            .is_some()
+    );
+    assert!(reopened.count_table("audit_entries").unwrap() <= 1);
+    assert!(reopened.count_table("webhook_deliveries").unwrap() <= 1);
+    assert!(reopened.count_table("cleanup_runs").unwrap() <= 1);
+}
+
+#[test]
+fn per_table_retention_rejects_missing_or_unbounded_table_policies() {
+    use super::repositories::{RetentionPolicy, RetentionTable, RetentionTablePolicy};
+
+    let missing = BTreeMap::new();
+    assert!(RetentionPolicy::new(missing).is_err());
+    let zero = RetentionTable::ALL
+        .into_iter()
+        .map(|table| {
+            (
+                table,
+                RetentionTablePolicy {
+                    cutoff_occurred_at: "2025-01-01T00:00:00Z".to_string(),
+                    max_rows: if table == RetentionTable::AuditEntries {
+                        0
+                    } else {
+                        1
+                    },
+                },
+            )
+        })
+        .collect();
+    assert!(RetentionPolicy::new(zero).is_err());
 }

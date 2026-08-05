@@ -5,14 +5,21 @@ mod artifacts_tests;
 #[cfg(test)]
 mod capture_tests;
 #[cfg(test)]
+mod query_pagination_tests;
+#[cfg(test)]
+mod query_tests;
+#[cfg(test)]
 mod tests;
 
 mod artifact_privacy;
+mod artifact_repository;
 mod artifacts;
 mod capture;
 mod cursor;
 mod error;
+mod maintenance;
 mod migrations;
+mod query;
 mod repositories;
 mod store;
 
@@ -28,5 +35,19 @@ pub use capture::{
 };
 pub use cursor::{decode_cursor, encode_cursor};
 pub use error::LogStoreError;
-pub use repositories::CascadeArtifactPointer;
+pub use maintenance::{
+    ArtifactDeletionFailureClass, ArtifactDeletionProgress, CleanupFilters, CleanupOutcome,
+    CleanupPreviewRequest, CleanupScope, DeleteOneRequest, MaintenanceAction, MaintenanceCounts,
+    MaintenanceExecutionControl, MaintenanceFingerprint, MaintenanceOperationId, MaintenanceReason,
+    MaintenanceReceipt, MaintenanceReceiptState, MaintenanceTimestamp,
+};
+pub use query::{
+    ArtifactRecord, EventRecord, MAX_QUERY_LIMIT, PageQuery, ProxyQuery, ProxyRecord, QueryPage,
+    QuerySort, RequestOutcome, RequestQuery, RequestRecord,
+};
+pub use repositories::{
+    CascadeArtifactPointer, RetentionCleanupResult, RetentionPolicy, RetentionTable,
+    RetentionTablePolicy, RetentionTableResult, WebhookDeliveryErrorCode,
+    WebhookDeliveryInsertOutcome, WebhookDeliveryRecord, WebhookDeliveryState, WebhookRetryOutcome,
+};
 pub use store::{Clock, LogStore, SystemClock as RealClock};

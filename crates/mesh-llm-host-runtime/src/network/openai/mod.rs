@@ -3,7 +3,7 @@ mod forwarded_request;
 pub(crate) mod ingress;
 pub(crate) mod moa_gateway;
 mod request_normalize;
-mod request_parse;
+pub(crate) mod request_parse;
 mod response;
 pub(crate) mod response_adapter;
 mod response_quality;

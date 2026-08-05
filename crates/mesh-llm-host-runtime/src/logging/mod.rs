@@ -7,28 +7,60 @@
 #![allow(dead_code, unused_imports)]
 
 mod bus;
+mod cleanup;
 pub mod foundation;
 mod lifecycle;
 mod limits;
+mod management_lifecycle;
+mod metrics;
+mod openai_lifecycle;
+mod operator_audit;
 mod persistence;
 pub mod policy;
+mod raw_mesh_lifecycle;
 mod registry;
+mod request_metadata;
 mod runtime_state;
 mod sequences;
 mod service;
 #[cfg(test)]
 mod service_tests;
+mod webhook_delivery;
+mod webhook_scheduler;
 mod writer;
 
-pub use bus::{BusEntry, PushOutcome, ReplayBus};
+pub use bus::{BusEntry, PushOutcome, ReplayBus, ReplayCursor, ReplayRecord, ReplayWindow};
 pub use foundation::LoggingFoundation;
 pub use lifecycle::{DuplicateTerminalError, LifecycleGuard, TerminalOutcome};
 pub use limits::{DynamicLoggingLimits, LoggingDynamicLimits};
+pub(crate) use management_lifecycle::ManagementRequestLifecycle;
+pub(crate) use metrics::{
+    LoggingArtifactCaptureStatus, LoggingCleanupOutcome, LoggingMetric, LoggingMetrics,
+    LoggingMetricsSink, LoggingTerminalOutcome, LoggingWebhookAttemptState,
+    LoggingWebhookDeliveryOutcome,
+};
+pub(crate) use openai_lifecycle::{
+    OpenAiLifecycleAttachment, OpenAiRouteAttempt, OpenAiRouteObserver,
+};
 pub use persistence::LogStoreSink;
-pub use registry::{RegistryConfig, RequestRegistry, RequestSummaryEntry};
+pub(crate) use raw_mesh_lifecycle::{
+    ProxyAttemptFinish, RawMeshLifecycleOwners, RawMeshProxyAttempt, RawMeshRemoteSuppressionLease,
+    RawMeshRequestLifecycle,
+};
+pub use registry::{ActiveRequestSnapshot, RegistryConfig, RequestRegistry, RequestSummaryEntry};
+pub(crate) use registry::{RequestSummaryEventSnapshots, RequestSummarySnapshot};
+pub(crate) use request_metadata::RequestSummaryMetadata;
+pub(crate) use runtime_state::LoggingQueryFacade;
+pub(crate) use runtime_state::LoggingRuntimeStatus;
 pub use runtime_state::{
     ArtifactCaptureRequest, LoggingRuntimeApplyError, LoggingRuntimeHealth, LoggingRuntimeState,
 };
 pub use sequences::SequenceGenerators;
 pub use service::{Clock, LoggingService, PersistSink, ServiceConfig, SystemClock};
+pub(crate) use webhook_delivery::{
+    RandomWebhookJitter, ReqwestWebhookTransport, SystemWebhookWorkerClock, WebhookDeliveryWorker,
+    WebhookJitter, WebhookTransport, WebhookTransportError, WebhookWorkerClock,
+    WebhookWorkerConfigError, WebhookWorkerError, WebhookWorkerOutcome,
+};
+pub(crate) use webhook_scheduler::WebhookDeliveryScheduler;
 pub use writer::{FailOpenWriter, RecursionGuard};

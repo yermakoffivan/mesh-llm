@@ -5,7 +5,8 @@ use crate::logging::{
 };
 use crate::logging::{ReplayBus, RequestRegistry, RequestSummaryEntry};
 use mesh_llm_events::logging::events::LifecycleEvent;
-use mesh_llm_events::logging::identifiers::{EventId, RequestId};
+use mesh_llm_events::logging::identifiers::{AttemptId, EventId, RequestId};
+use mesh_llm_events::logging::proxy::ProxyRecord;
 use mesh_llm_events::logging::replay::ReplayChannel;
 
 // Re-import service.rs types. These are private to the logging module but accessible via super.
@@ -170,6 +171,9 @@ impl PersistSink for TestSink {
     }
 
     async fn persist_proxy_record(&self, proxy_json: String) -> Result<(), String> {
+        if let Some(tx) = &self.audit_attempt_notifications {
+            let _ = tx.send(());
+        }
         if self.fail_flag.load(AtomicOrdering::Acquire) > 0 {
             return Err("sink failing".into());
         }
@@ -617,6 +621,166 @@ async fn attempt_records_are_delivered_under_the_parent_request() {
         1,
         "the parent request owns one summary despite multiple attempts"
     );
+}
+
+fn proxy_record(request_id: RequestId, attempt_id: AttemptId) -> ProxyRecord {
+    ProxyRecord {
+        attempt_id,
+        request_id,
+        target: "remote".to_string(),
+        provider: Some("openai_frontend".to_string()),
+        engine: Some("responses".to_string()),
+        started_at: "2026-08-04T12:00:00Z".to_string(),
+        completed_at: Some("2026-08-04T12:00:01Z".to_string()),
+        status_code: Some(502),
+        error: Some("timeout".to_string()),
+    }
+}
+
+#[tokio::test]
+async fn proxy_record_delivery_is_bounded_and_does_not_own_a_terminal() {
+    let sink = Arc::new(TestSink::new());
+    let service = LoggingService::new(
+        ServiceConfig::default(),
+        Arc::clone(&sink) as Arc<dyn PersistSink>,
+        Box::new(TestClock::new()),
+    );
+    let request_id = RequestId::new();
+    let attempt_id = AttemptId::new();
+
+    assert!(
+        service
+            .enqueue_proxy_record(proxy_record(request_id, attempt_id))
+            .is_ok()
+    );
+    assert_eq!(service.pump_sync().await, 1);
+    assert_eq!(service.registry_ref().active_count(), 0);
+    assert_eq!(service.registry_ref().recent_count(), 0);
+    assert_eq!(service.bus_ref().len(), 0);
+
+    let records = sink.records();
+    let proxy_json = records
+        .into_iter()
+        .find_map(|record| match record {
+            TestRecord::ProxyRecord(proxy_json) => Some(proxy_json),
+            _ => None,
+        })
+        .expect("one proxy record persists");
+    let persisted: ProxyRecord = serde_json::from_str(&proxy_json).expect("bounded proxy JSON");
+    assert_eq!(persisted.attempt_id, attempt_id);
+    assert_eq!(persisted.request_id, request_id);
+    assert_eq!(persisted.target, "remote");
+    assert_eq!(persisted.provider.as_deref(), Some("openai_frontend"));
+    assert_eq!(persisted.engine.as_deref(), Some("responses"));
+    assert_eq!(persisted.error.as_deref(), Some("timeout"));
+    assert_eq!(persisted.status_code, Some(502));
+    assert_eq!(persisted.started_at, "2026-08-04T12:00:00Z");
+    assert_eq!(
+        persisted.completed_at.as_deref(),
+        Some("2026-08-04T12:00:01Z")
+    );
+}
+
+#[tokio::test]
+async fn proxy_record_drops_unknown_target_and_strips_untrusted_metadata() {
+    let sink = Arc::new(TestSink::new());
+    let service = LoggingService::new(
+        ServiceConfig::default(),
+        Arc::clone(&sink) as Arc<dyn PersistSink>,
+        Box::new(TestClock::new()),
+    );
+    let request_id = RequestId::new();
+    let attempt_id = AttemptId::new();
+    let rejected = ProxyRecord {
+        target: "https://host.invalid/path".to_string(),
+        ..proxy_record(request_id, attempt_id)
+    };
+
+    assert!(service.enqueue_proxy_record(rejected).is_ok());
+    assert_eq!(service.persistence_queue_drops(), 1);
+    assert_eq!(service.pump_sync().await, 0);
+    assert!(sink.records().is_empty());
+
+    let stripped = ProxyRecord {
+        provider: Some("untrusted_provider".to_string()),
+        engine: Some("untrusted_engine".to_string()),
+        error: Some("untrusted_error_text".to_string()),
+        ..proxy_record(request_id, AttemptId::new())
+    };
+    assert!(service.enqueue_proxy_record(stripped).is_ok());
+    assert_eq!(service.pump_sync().await, 1);
+    let proxy_json = sink
+        .records()
+        .into_iter()
+        .find_map(|record| match record {
+            TestRecord::ProxyRecord(proxy_json) => Some(proxy_json),
+            _ => None,
+        })
+        .expect("sanitized proxy record persists");
+    assert!(!proxy_json.contains("untrusted_provider"));
+    assert!(!proxy_json.contains("untrusted_engine"));
+    assert!(!proxy_json.contains("untrusted_error_text"));
+    let persisted: ProxyRecord = serde_json::from_str(&proxy_json).expect("sanitized proxy JSON");
+    assert_eq!(persisted.target, "remote");
+    assert!(persisted.provider.is_none());
+    assert!(persisted.engine.is_none());
+    assert!(persisted.error.is_none());
+}
+
+#[tokio::test]
+async fn proxy_record_queue_saturation_stays_fail_open() {
+    let sink = Arc::new(TestSink::new());
+    let service = LoggingService::new(
+        ServiceConfig::default(),
+        Arc::clone(&sink) as Arc<dyn PersistSink>,
+        Box::new(TestClock::new()),
+    );
+    let request_id = RequestId::new();
+
+    for _ in 0..65 {
+        assert!(
+            service
+                .enqueue_proxy_record(proxy_record(request_id, AttemptId::new()))
+                .is_ok()
+        );
+    }
+    assert_eq!(service.persistence_queue_drops(), 1);
+    assert_eq!(service.pump_sync().await, 64);
+    assert_eq!(
+        sink.records()
+            .iter()
+            .filter(|record| matches!(record, TestRecord::ProxyRecord(_)))
+            .count(),
+        64
+    );
+}
+
+#[tokio::test]
+async fn proxy_record_sink_failure_stays_fail_open() {
+    let (sink, mut attempts) = TestSink::failing_with_attempt_notifications();
+    let service = LoggingService::new(
+        ServiceConfig::default(),
+        Arc::new(sink),
+        Box::new(TestClock::new()),
+    );
+    assert!(service.spawn());
+
+    assert!(
+        service
+            .enqueue_proxy_record(proxy_record(RequestId::new(), AttemptId::new()))
+            .is_ok()
+    );
+    attempts
+        .recv()
+        .await
+        .expect("proxy persistence is attempted");
+    attempts
+        .recv()
+        .await
+        .expect("fallback audit persistence is attempted");
+    assert_eq!(service.persistence_failures(), 2);
+    assert_eq!(service.persistence_queue_drops(), 0);
+    assert!(service.shutdown().await);
 }
 
 #[tokio::test]

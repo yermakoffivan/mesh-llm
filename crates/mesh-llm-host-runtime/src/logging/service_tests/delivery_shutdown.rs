@@ -118,12 +118,9 @@ async fn spawn_and_shutdown_recover_a_poisoned_worker_handle_lock() {
     let poison_target = Arc::clone(&service);
 
     assert!(
-        std::thread::spawn(move || {
-            let _worker_handle = poison_target.worker_handle_lock_for_test();
-            panic!("poison worker handle lock for recovery coverage");
-        })
-        .join()
-        .is_err()
+        std::thread::spawn(move || poison_target.poison_worker_handle_for_test())
+            .join()
+            .is_err()
     );
 
     assert!(service.spawn());

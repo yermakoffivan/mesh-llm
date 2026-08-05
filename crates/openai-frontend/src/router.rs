@@ -4,17 +4,17 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use axum::{
     Json, Router,
     body::Body,
-    extract::{DefaultBodyLimit, State, rejection::JsonRejection},
-    http::{HeaderMap, HeaderValue, Method, Request, StatusCode, Uri, header::HeaderName},
+    extract::{DefaultBodyLimit, Extension, State, rejection::JsonRejection},
+    http::{HeaderMap, Method, Request, StatusCode, Uri, header::HeaderName},
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -34,6 +34,11 @@ use crate::{
     common::{AgentSessionIdentity, AgentSessionSource},
     completions::CompletionRequest,
     errors::OpenAiError,
+    lifecycle::{
+        OpenAiBackendOperation, OpenAiFailure, OpenAiFrontendRoute, OpenAiLifecycleContext,
+        OpenAiLifecycleEvent, OpenAiLifecycleObserver, OpenAiRejection, OpenAiRequestMethod,
+        OpenAiTerminalResult, request_id_from_headers_or_generate, request_id_response_header,
+    },
     models::ModelsResponse,
     responses::{
         ResponseAdapterMode, ResponseSseState, chunk_delta_text, normalize_openai_compat_request,
@@ -47,19 +52,46 @@ use crate::{
     sse::{done_event, json_event},
 };
 
+pub use crate::lifecycle::RequestId;
+
 #[derive(Clone)]
 struct FrontendState {
     backend: SharedBackend,
     config: OpenAiFrontendConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl FrontendState {
+    fn observe(&self, event: OpenAiLifecycleEvent) {
+        if let Some(observer) = &self.config.lifecycle_observer {
+            observer.observe(&event);
+        }
+    }
+
+    fn stream_lifecycle(&self, context: OpenAiLifecycleContext) -> StreamLifecycle {
+        StreamLifecycle::new(self.config.lifecycle_observer.clone(), context)
+    }
+}
+
+#[derive(Clone)]
 pub struct OpenAiFrontendConfig {
     pub max_request_body_bytes: usize,
     pub backend_timeout: Option<Duration>,
     /// Header accepted as stable agent-session identity from the endpoint's
     /// trusted immediate upstream. `None` disables header-derived identity.
     pub agent_session_header: Option<HeaderName>,
+    lifecycle_observer: Option<Arc<dyn OpenAiLifecycleObserver>>,
+}
+
+impl std::fmt::Debug for OpenAiFrontendConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OpenAiFrontendConfig")
+            .field("max_request_body_bytes", &self.max_request_body_bytes)
+            .field("backend_timeout", &self.backend_timeout)
+            .field("agent_session_header", &self.agent_session_header)
+            .field("has_lifecycle_observer", &self.lifecycle_observer.is_some())
+            .finish()
+    }
 }
 
 impl OpenAiFrontendConfig {
@@ -85,6 +117,12 @@ impl OpenAiFrontendConfig {
         self.agent_session_header = Some(header);
         self
     }
+
+    /// Observe metadata-only lifecycle boundaries for frontend ingress.
+    pub fn with_lifecycle_observer(mut self, observer: Arc<dyn OpenAiLifecycleObserver>) -> Self {
+        self.lifecycle_observer = Some(observer);
+        self
+    }
 }
 
 impl Default for OpenAiFrontendConfig {
@@ -93,6 +131,7 @@ impl Default for OpenAiFrontendConfig {
             max_request_body_bytes: Self::DEFAULT_MAX_REQUEST_BODY_BYTES,
             backend_timeout: Some(Self::DEFAULT_BACKEND_TIMEOUT),
             agent_session_header: None,
+            lifecycle_observer: None,
         }
     }
 }
@@ -119,6 +158,7 @@ pub fn router_for_with_config(
     backend: Arc<dyn OpenAiBackend>,
     config: OpenAiFrontendConfig,
 ) -> Router {
+    let state = FrontendState { backend, config };
     Router::new()
         .route("/health", get(health))
         .route("/healthz", get(health))
@@ -129,9 +169,12 @@ pub fn router_for_with_config(
         .route("/v1/responses", post(responses))
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(not_found)
-        .layer(middleware::from_fn(request_id_middleware))
-        .layer(DefaultBodyLimit::max(config.max_request_body_bytes))
-        .with_state(FrontendState { backend, config })
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            frontend_lifecycle_middleware,
+        ))
+        .layer(DefaultBodyLimit::max(state.config.max_request_body_bytes))
+        .with_state(state)
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -143,13 +186,33 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 
-async fn ready(State(state): State<FrontendState>) -> Result<Json<HealthResponse>, OpenAiError> {
-    backend_call(&state, "models", state.backend.models()).await?;
+async fn ready(
+    State(state): State<FrontendState>,
+    Extension(context): Extension<OpenAiLifecycleContext>,
+) -> Result<Json<HealthResponse>, OpenAiError> {
+    backend_call(
+        &state,
+        &context,
+        OpenAiBackendOperation::Models,
+        "models",
+        state.backend.models(),
+    )
+    .await?;
     Ok(Json(HealthResponse { status: "ready" }))
 }
 
-async fn models(State(state): State<FrontendState>) -> Result<Json<ModelsResponse>, OpenAiError> {
-    let data = backend_call(&state, "models", state.backend.models()).await?;
+async fn models(
+    State(state): State<FrontendState>,
+    Extension(context): Extension<OpenAiLifecycleContext>,
+) -> Result<Json<ModelsResponse>, OpenAiError> {
+    let data = backend_call(
+        &state,
+        &context,
+        OpenAiBackendOperation::Models,
+        "models",
+        state.backend.models(),
+    )
+    .await?;
     Ok(Json(ModelsResponse {
         object: "list",
         data,
@@ -158,6 +221,7 @@ async fn models(State(state): State<FrontendState>) -> Result<Json<ModelsRespons
 
 async fn chat_completions(
     State(state): State<FrontendState>,
+    Extension(context): Extension<OpenAiLifecycleContext>,
     headers: HeaderMap,
     payload: Result<Json<ChatCompletionRequest>, JsonRejection>,
 ) -> Result<Response, OpenAiError> {
@@ -167,38 +231,50 @@ async fn chat_completions(
     if request.stream {
         let include_usage = request.include_usage();
         let model = request.model.clone();
-        let context = OpenAiRequestContext::new();
-        let cancellation = context.cancellation_token();
+        let backend_context = OpenAiRequestContext::with_request_id(context.request_id);
+        let cancellation = backend_context.cancellation_token();
         let stream = backend_call_with_cancellation(
             &state,
-            "chat_completion_stream",
             &context,
+            OpenAiBackendOperation::ChatCompletionStream,
+            "chat_completion_stream",
+            &backend_context,
             state
                 .backend
-                .chat_completion_stream(request, context.clone()),
+                .chat_completion_stream(request, backend_context.clone()),
         )
         .await?;
         let prelude = stream::once(async move { json_event(&ChatCompletionChunk::role(model)) });
+        let lifecycle = state.stream_lifecycle(context);
+        let error_lifecycle = lifecycle.clone();
         let events = prelude
-            .chain(stream.filter_map(move |item| async move {
-                match item {
-                    Ok(chunk) if !include_usage && chunk.usage.is_some() => None,
-                    Ok(chunk) => Some(json_event(&chunk)),
-                    Err(error) => Some(json_event(&error.body())),
+            .chain(stream.filter_map(move |item| {
+                let error_lifecycle = error_lifecycle.clone();
+                async move {
+                    match item {
+                        Ok(chunk) if !include_usage && chunk.usage.is_some() => None,
+                        Ok(chunk) => Some(json_event(&chunk)),
+                        Err(error) => {
+                            error_lifecycle.failed(&error);
+                            Some(json_event(&error.body()))
+                        }
+                    }
                 }
             }))
             .chain(stream::once(async { done_event() }));
-        Ok(sse_response(events, cancellation))
+        Ok(sse_response(events, cancellation, lifecycle))
     } else {
-        let context = OpenAiRequestContext::new();
+        let backend_context = OpenAiRequestContext::with_request_id(context.request_id);
         Ok(Json(
             backend_call_with_cancellation(
                 &state,
-                "chat_completion",
                 &context,
+                OpenAiBackendOperation::ChatCompletion,
+                "chat_completion",
+                &backend_context,
                 state
                     .backend
-                    .chat_completion_with_context(request, context.clone()),
+                    .chat_completion_with_context(request, backend_context.clone()),
             )
             .await?,
         )
@@ -208,6 +284,7 @@ async fn chat_completions(
 
 async fn responses(
     State(state): State<FrontendState>,
+    Extension(context): Extension<OpenAiLifecycleContext>,
     headers: HeaderMap,
     payload: Result<Json<Value>, JsonRejection>,
 ) -> Result<Response, OpenAiError> {
@@ -225,19 +302,23 @@ async fn responses(
     request.validate()?;
     match normalization.response_adapter {
         ResponseAdapterMode::OpenAiResponsesStream => {
-            let context = OpenAiRequestContext::new();
-            let cancellation = context.cancellation_token();
+            let backend_context = OpenAiRequestContext::with_request_id(context.request_id);
+            let cancellation = backend_context.cancellation_token();
             let state_machine = Arc::new(Mutex::new(ResponseSseState::new(request.model.clone())));
             let stream = backend_call_with_cancellation(
                 &state,
-                "responses_stream",
                 &context,
+                OpenAiBackendOperation::ResponsesStream,
+                "responses_stream",
+                &backend_context,
                 state
                     .backend
-                    .chat_completion_stream(request, context.clone()),
+                    .chat_completion_stream(request, backend_context.clone()),
             )
             .await?;
             let body_state = state_machine.clone();
+            let lifecycle = state.stream_lifecycle(context);
+            let error_lifecycle = lifecycle.clone();
             let body_events = stream.flat_map(move |item| {
                 let mut out = Vec::new();
                 let mut state_machine = body_state
@@ -312,6 +393,7 @@ async fn responses(
                         }
                     }
                     Err(error) => {
+                        error_lifecycle.failed(&error);
                         state_machine.failed = true;
                         out.push(
                             Event::default()
@@ -422,17 +504,19 @@ async fn responses(
             let events = body_events
                 .chain(tail_events)
                 .chain(stream::once(async { done_event() }));
-            Ok(sse_response(events, cancellation))
+            Ok(sse_response(events, cancellation, lifecycle))
         }
         _ => {
-            let context = OpenAiRequestContext::new();
+            let backend_context = OpenAiRequestContext::with_request_id(context.request_id);
             let response = backend_call_with_cancellation(
                 &state,
-                "responses",
                 &context,
+                OpenAiBackendOperation::Responses,
+                "responses",
+                &backend_context,
                 state
                     .backend
-                    .chat_completion_with_context(request, context.clone()),
+                    .chat_completion_with_context(request, backend_context.clone()),
             )
             .await?;
             let translated = translate_chat_completion_response_to_responses(&response)?;
@@ -443,6 +527,7 @@ async fn responses(
 
 async fn completions(
     State(state): State<FrontendState>,
+    Extension(context): Extension<OpenAiLifecycleContext>,
     headers: HeaderMap,
     payload: Result<Json<CompletionRequest>, JsonRejection>,
 ) -> Result<Response, OpenAiError> {
@@ -451,35 +536,49 @@ async fn completions(
     request.validate()?;
     if request.stream {
         let include_usage = request.include_usage();
-        let context = OpenAiRequestContext::new();
-        let cancellation = context.cancellation_token();
+        let backend_context = OpenAiRequestContext::with_request_id(context.request_id);
+        let cancellation = backend_context.cancellation_token();
         let stream = backend_call_with_cancellation(
             &state,
-            "completion_stream",
             &context,
-            state.backend.completion_stream(request, context.clone()),
+            OpenAiBackendOperation::CompletionStream,
+            "completion_stream",
+            &backend_context,
+            state
+                .backend
+                .completion_stream(request, backend_context.clone()),
         )
         .await?;
+        let lifecycle = state.stream_lifecycle(context);
+        let error_lifecycle = lifecycle.clone();
         let events = stream
-            .filter_map(move |item| async move {
-                match item {
-                    Ok(chunk) if !include_usage && chunk.usage.is_some() => None,
-                    Ok(chunk) => Some(json_event(&chunk)),
-                    Err(error) => Some(json_event(&error.body())),
+            .filter_map(move |item| {
+                let error_lifecycle = error_lifecycle.clone();
+                async move {
+                    match item {
+                        Ok(chunk) if !include_usage && chunk.usage.is_some() => None,
+                        Ok(chunk) => Some(json_event(&chunk)),
+                        Err(error) => {
+                            error_lifecycle.failed(&error);
+                            Some(json_event(&error.body()))
+                        }
+                    }
                 }
             })
             .chain(stream::once(async { done_event() }));
-        Ok(sse_response(events, cancellation))
+        Ok(sse_response(events, cancellation, lifecycle))
     } else {
-        let context = OpenAiRequestContext::new();
+        let backend_context = OpenAiRequestContext::with_request_id(context.request_id);
         Ok(Json(
             backend_call_with_cancellation(
                 &state,
-                "completion",
                 &context,
+                OpenAiBackendOperation::Completion,
+                "completion",
+                &backend_context,
                 state
                     .backend
-                    .completion_with_context(request, context.clone()),
+                    .completion_with_context(request, backend_context.clone()),
             )
             .await?,
         )
@@ -522,6 +621,31 @@ fn resolve_agent_session(
     }
 }
 
+async fn backend_call<T, F>(
+    state: &FrontendState,
+    context: &OpenAiLifecycleContext,
+    backend_operation: OpenAiBackendOperation,
+    operation_name: &'static str,
+    future: F,
+) -> OpenAiResult<T>
+where
+    F: Future<Output = OpenAiResult<T>>,
+{
+    state.observe(OpenAiLifecycleEvent::BackendDispatched {
+        context: context.clone(),
+        operation: backend_operation,
+    });
+    match state.config.backend_timeout {
+        Some(timeout) => tokio::time::timeout(timeout, future).await.map_err(|_| {
+            OpenAiError::timeout(format!(
+                "{operation_name} timed out after {} ms",
+                timeout.as_millis()
+            ))
+        })?,
+        None => future.await,
+    }
+}
+
 struct CancelOnDrop {
     context: OpenAiRequestContext,
     armed: bool,
@@ -550,21 +674,27 @@ impl Drop for CancelOnDrop {
 
 async fn backend_call_with_cancellation<T, F>(
     state: &FrontendState,
-    operation: &'static str,
-    context: &OpenAiRequestContext,
+    lifecycle_context: &OpenAiLifecycleContext,
+    backend_operation: OpenAiBackendOperation,
+    operation_name: &'static str,
+    request_context: &OpenAiRequestContext,
     future: F,
 ) -> OpenAiResult<T>
 where
     F: Future<Output = OpenAiResult<T>>,
 {
-    let mut cancel_on_drop = CancelOnDrop::new(context);
+    state.observe(OpenAiLifecycleEvent::BackendDispatched {
+        context: lifecycle_context.clone(),
+        operation: backend_operation,
+    });
+    let mut cancel_on_drop = CancelOnDrop::new(request_context);
     let result = match state.config.backend_timeout {
         Some(timeout) => match tokio::time::timeout(timeout, future).await {
             Ok(result) => result,
             Err(_) => {
-                context.cancel();
+                request_context.cancel();
                 return Err(OpenAiError::timeout(format!(
-                    "{operation} timed out after {} ms",
+                    "{operation_name} timed out after {} ms",
                     timeout.as_millis()
                 )));
             }
@@ -573,25 +703,6 @@ where
     };
     cancel_on_drop.disarm();
     result
-}
-
-async fn backend_call<T, F>(
-    state: &FrontendState,
-    operation: &'static str,
-    future: F,
-) -> OpenAiResult<T>
-where
-    F: Future<Output = OpenAiResult<T>>,
-{
-    match state.config.backend_timeout {
-        Some(timeout) => tokio::time::timeout(timeout, future).await.map_err(|_| {
-            OpenAiError::timeout(format!(
-                "{operation} timed out after {} ms",
-                timeout.as_millis()
-            ))
-        })?,
-        None => future.await,
-    }
 }
 
 fn json_payload<T>(payload: Result<Json<T>, JsonRejection>) -> Result<Json<T>, OpenAiError> {
@@ -611,28 +722,30 @@ async fn method_not_allowed(method: Method) -> OpenAiError {
     OpenAiError::method_not_allowed(method)
 }
 
-static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
-static REQUEST_ID_HEADER: HeaderName = HeaderName::from_static("x-request-id");
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestId(pub String);
-
-async fn request_id_middleware(mut request: Request<Body>, next: Next) -> Response {
-    let request_id = request_id_from_headers(request.headers()).unwrap_or_else(new_request_id);
+async fn frontend_lifecycle_middleware(
+    State(state): State<FrontendState>,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    let request_id = request_id_from_headers_or_generate(request.headers());
     let method = request.method().clone();
     let uri = request.uri().clone();
-    request
-        .extensions_mut()
-        .insert(RequestId(request_id.clone()));
+    let context =
+        OpenAiLifecycleContext::new(request_id, lifecycle_method(&method), lifecycle_route(&uri));
+    request.extensions_mut().insert(request_id);
+    request.extensions_mut().insert(context.clone());
+    state.observe(OpenAiLifecycleEvent::Admitted {
+        context: context.clone(),
+    });
 
     let mut response = next.run(request).await;
-    if let Ok(value) = HeaderValue::from_str(&request_id) {
-        response
-            .headers_mut()
-            .insert(REQUEST_ID_HEADER.clone(), value);
+    let (header_name, header_value) = request_id_response_header(&request_id);
+    response.headers_mut().insert(header_name, header_value);
+    if response.extensions().get::<StreamingResponse>().is_none() {
+        observe_non_stream_terminal(&state, context.clone(), response.status());
     }
     tracing::info!(
-        request_id = %request_id,
+        request_id = %request_id.as_ref(),
         method = %method,
         uri = %uri,
         status = %response.status(),
@@ -641,46 +754,164 @@ async fn request_id_middleware(mut request: Request<Body>, next: Next) -> Respon
     response
 }
 
-fn request_id_from_headers(headers: &axum::http::HeaderMap) -> Option<String> {
-    headers
-        .get(&REQUEST_ID_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
+fn lifecycle_method(method: &Method) -> OpenAiRequestMethod {
+    match *method {
+        Method::GET => OpenAiRequestMethod::Get,
+        Method::POST => OpenAiRequestMethod::Post,
+        _ => OpenAiRequestMethod::Other,
+    }
 }
 
-fn new_request_id() -> String {
-    let counter = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    format!("req-{millis}-{counter}")
+fn lifecycle_route(uri: &Uri) -> OpenAiFrontendRoute {
+    match uri.path() {
+        "/health" => OpenAiFrontendRoute::Health,
+        "/healthz" => OpenAiFrontendRoute::Healthz,
+        "/readyz" => OpenAiFrontendRoute::Readyz,
+        "/v1/models" => OpenAiFrontendRoute::Models,
+        "/v1/chat/completions" => OpenAiFrontendRoute::ChatCompletions,
+        "/v1/completions" => OpenAiFrontendRoute::Completions,
+        "/v1/responses" => OpenAiFrontendRoute::Responses,
+        _ => OpenAiFrontendRoute::Unknown,
+    }
 }
 
-fn sse_response<S>(events: S, cancellation: CancellationToken) -> Response
+fn observe_non_stream_terminal(
+    state: &FrontendState,
+    context: OpenAiLifecycleContext,
+    status: StatusCode,
+) {
+    if status.is_client_error() {
+        state.observe(OpenAiLifecycleEvent::Rejected {
+            context,
+            status_code: status.as_u16(),
+            rejection: rejection_for_status(status),
+        });
+        return;
+    }
+
+    let result = if status.is_server_error() {
+        OpenAiTerminalResult::Failed {
+            status_code: status.as_u16(),
+            failure: failure_for_status(status),
+        }
+    } else {
+        OpenAiTerminalResult::Completed {
+            status_code: status.as_u16(),
+        }
+    };
+    state.observe(OpenAiLifecycleEvent::NonStreamTerminal { context, result });
+}
+
+fn rejection_for_status(status: StatusCode) -> OpenAiRejection {
+    match status {
+        StatusCode::PAYLOAD_TOO_LARGE => OpenAiRejection::PayloadTooLarge,
+        StatusCode::METHOD_NOT_ALLOWED => OpenAiRejection::MethodNotAllowed,
+        StatusCode::NOT_FOUND => OpenAiRejection::NotFound,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => OpenAiRejection::AdmissionDenied,
+        _ => OpenAiRejection::InvalidRequest,
+    }
+}
+
+fn failure_for_status(status: StatusCode) -> OpenAiFailure {
+    match status {
+        StatusCode::GATEWAY_TIMEOUT => OpenAiFailure::Timeout,
+        StatusCode::INTERNAL_SERVER_ERROR => OpenAiFailure::Internal,
+        _ => OpenAiFailure::Backend,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StreamingResponse;
+
+fn sse_response<S>(
+    events: S,
+    cancellation: CancellationToken,
+    lifecycle: StreamLifecycle,
+) -> Response
 where
     S: Stream<Item = Result<Event, Infallible>> + Send + 'static,
 {
-    Sse::new(CancelOnDropSseStream::new(events, cancellation))
+    let mut response = Sse::new(CancelOnDropSseStream::new(events, cancellation, lifecycle))
         .keep_alive(KeepAlive::default())
-        .into_response()
+        .into_response();
+    response.extensions_mut().insert(StreamingResponse);
+    response
+}
+
+#[derive(Clone)]
+struct StreamLifecycle {
+    observer: Option<Arc<dyn OpenAiLifecycleObserver>>,
+    context: OpenAiLifecycleContext,
+    terminal: Arc<AtomicBool>,
+}
+
+impl StreamLifecycle {
+    fn new(
+        observer: Option<Arc<dyn OpenAiLifecycleObserver>>,
+        context: OpenAiLifecycleContext,
+    ) -> Self {
+        Self {
+            observer,
+            context,
+            terminal: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn completed(&self) {
+        self.observe_terminal(OpenAiLifecycleEvent::StreamTerminal {
+            context: self.context.clone(),
+            result: OpenAiTerminalResult::Completed { status_code: 200 },
+        });
+    }
+
+    fn failed(&self, error: &OpenAiError) {
+        self.observe_terminal(OpenAiLifecycleEvent::StreamTerminal {
+            context: self.context.clone(),
+            result: OpenAiTerminalResult::Failed {
+                status_code: error.status().as_u16(),
+                failure: failure_for_status(error.status()),
+            },
+        });
+    }
+
+    fn dropped(&self, cancelled: bool) {
+        let event = if cancelled {
+            OpenAiLifecycleEvent::StreamCancelled {
+                context: self.context.clone(),
+            }
+        } else {
+            OpenAiLifecycleEvent::StreamDropped {
+                context: self.context.clone(),
+            }
+        };
+        self.observe_terminal(event);
+    }
+
+    fn observe_terminal(&self, event: OpenAiLifecycleEvent) {
+        if self.terminal.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(observer) = &self.observer {
+            observer.observe(&event);
+        }
+    }
 }
 
 struct CancelOnDropSseStream {
     inner: Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send + 'static>>,
     cancellation: CancellationToken,
+    lifecycle: StreamLifecycle,
 }
 
 impl CancelOnDropSseStream {
-    fn new<S>(inner: S, cancellation: CancellationToken) -> Self
+    fn new<S>(inner: S, cancellation: CancellationToken, lifecycle: StreamLifecycle) -> Self
     where
         S: Stream<Item = Result<Event, Infallible>> + Send + 'static,
     {
         Self {
             inner: Box::pin(inner),
             cancellation,
+            lifecycle,
         }
     }
 }
@@ -689,12 +920,17 @@ impl Stream for CancelOnDropSseStream {
     type Item = Result<Event, Infallible>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.inner.as_mut().poll_next(cx)
+        let poll = self.inner.as_mut().poll_next(cx);
+        if matches!(poll, Poll::Ready(None)) {
+            self.lifecycle.completed();
+        }
+        poll
     }
 }
 
 impl Drop for CancelOnDropSseStream {
     fn drop(&mut self) {
+        self.lifecycle.dropped(self.cancellation.is_cancelled());
         self.cancellation.cancel();
     }
 }
@@ -728,10 +964,120 @@ mod tests {
         common::Usage,
         completions::{CompletionPrompt, CompletionResponse},
         errors::{OpenAiErrorKind, already_openai_error, map_upstream_error_body},
+        guardrails::{GuardedOpenAiBackend, GuardrailMode, GuardrailPolicy},
         models::ModelObject,
     };
 
     struct FakeBackend;
+
+    #[derive(Default)]
+    struct GuardrailRescueBackend {
+        seen_chat_requests: Mutex<Vec<ChatCompletionRequest>>,
+    }
+
+    #[async_trait]
+    impl OpenAiBackend for GuardrailRescueBackend {
+        async fn models(&self) -> OpenAiResult<Vec<ModelObject>> {
+            Ok(vec![ModelObject::new("Qwen3-8B-Q4_K_M")])
+        }
+
+        async fn chat_completion(
+            &self,
+            request: ChatCompletionRequest,
+        ) -> OpenAiResult<ChatCompletionResponse> {
+            self.seen_chat_requests
+                .lock()
+                .unwrap()
+                .push(request.clone());
+            Ok(ChatCompletionResponse {
+                id: "chatcmpl_guarded_tool".to_string(),
+                object: "chat.completion",
+                created: 123,
+                model: request.model,
+                choices: vec![ChatCompletionChoice {
+                    index: 0,
+                    message: AssistantMessage {
+                        role: "assistant",
+                        content: None,
+                        reasoning_content: None,
+                        tool_calls: Some(json!([{
+                            "id": "call_lookup",
+                            "type": "function",
+                            "function": {
+                                "name": "lookup",
+                                "arguments": "{\"city\":\"Sydney\"}"
+                            }
+                        }])),
+                    },
+                    logprobs: None,
+                    finish_reason: Some(FinishReason::ToolCalls),
+                }],
+                usage: Usage::new(3, 2),
+                timings: None,
+            })
+        }
+
+        async fn chat_completion_stream(
+            &self,
+            _request: ChatCompletionRequest,
+            _context: OpenAiRequestContext,
+        ) -> OpenAiResult<ChatCompletionStream> {
+            unreachable!("guardrail rescue test uses non-streaming requests")
+        }
+
+        async fn completion(
+            &self,
+            _request: CompletionRequest,
+        ) -> OpenAiResult<CompletionResponse> {
+            unreachable!("guardrail rescue test only calls chat")
+        }
+
+        async fn completion_stream(
+            &self,
+            _request: CompletionRequest,
+            _context: OpenAiRequestContext,
+        ) -> OpenAiResult<CompletionStream> {
+            unreachable!("guardrail rescue test only calls chat")
+        }
+    }
+
+    fn guarded_test_app(backend: Arc<GuardrailRescueBackend>) -> Router {
+        let guarded = Arc::new(GuardedOpenAiBackend::new(
+            backend,
+            GuardrailPolicy {
+                mode: GuardrailMode::Enforce,
+                apply_to_all_models: true,
+                ..GuardrailPolicy::default()
+            },
+        ));
+        router_for_with_config(
+            guarded,
+            OpenAiFrontendConfig::default().without_backend_timeout(),
+        )
+    }
+
+    #[derive(Default)]
+    struct RecordingLifecycleObserver {
+        events: Mutex<Vec<OpenAiLifecycleEvent>>,
+    }
+
+    impl RecordingLifecycleObserver {
+        fn events(&self) -> Vec<OpenAiLifecycleEvent> {
+            self.events
+                .lock()
+                .expect("lifecycle observer lock poisoned")
+                .clone()
+        }
+    }
+
+    impl OpenAiLifecycleObserver for RecordingLifecycleObserver {
+        fn observe(&self, event: &OpenAiLifecycleEvent) {
+            self.events
+                .lock()
+                .expect("lifecycle observer lock poisoned")
+                .push(event.clone());
+        }
+    }
 
     #[async_trait]
     impl OpenAiBackend for FakeBackend {
@@ -948,42 +1294,6 @@ mod tests {
             unreachable!("agent-session tests use non-streaming requests")
         }
     }
-
-    struct NonStreamingCancellationBackend {
-        token: Arc<Mutex<Option<CancellationToken>>>,
-    }
-
-    #[async_trait]
-    impl OpenAiBackend for NonStreamingCancellationBackend {
-        async fn models(&self) -> OpenAiResult<Vec<ModelObject>> {
-            Ok(vec![ModelObject::new("cancel-model")])
-        }
-
-        async fn chat_completion(
-            &self,
-            _request: ChatCompletionRequest,
-        ) -> OpenAiResult<ChatCompletionResponse> {
-            unreachable!("frontend must use the context-aware non-streaming path")
-        }
-
-        async fn chat_completion_with_context(
-            &self,
-            _request: ChatCompletionRequest,
-            context: OpenAiRequestContext,
-        ) -> OpenAiResult<ChatCompletionResponse> {
-            *self.token.lock().expect("token lock poisoned") = Some(context.cancellation_token());
-            std::future::pending().await
-        }
-
-        async fn chat_completion_stream(
-            &self,
-            _request: ChatCompletionRequest,
-            _context: OpenAiRequestContext,
-        ) -> OpenAiResult<ChatCompletionStream> {
-            unreachable!("cancellation backend test only calls non-streaming")
-        }
-    }
-
     #[async_trait]
     impl OpenAiBackend for CancellationBackend {
         async fn models(&self) -> OpenAiResult<Vec<ModelObject>> {
@@ -1138,6 +1448,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn healthz_observer_records_completed_terminal() {
+        let observer = Arc::new(RecordingLifecycleObserver::default());
+        let app = router_for_with_config(
+            Arc::new(FakeBackend),
+            OpenAiFrontendConfig::default().with_lifecycle_observer(observer.clone()),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .header("x-request-id", "00000000-0000-4000-8000-000000000021")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let events = observer.events();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                OpenAiLifecycleEvent::Admitted { context },
+                OpenAiLifecycleEvent::NonStreamTerminal { context: terminal_context, result: OpenAiTerminalResult::Completed { status_code: 200 } },
+            ] if context.route == OpenAiFrontendRoute::Healthz
+                && context.method == OpenAiRequestMethod::Get
+                && context == terminal_context
+        ));
+    }
+
+    #[tokio::test]
     async fn readiness_route_checks_backend_models() {
         let app = router_for(Arc::new(FakeBackend));
         let response = app
@@ -1176,6 +1517,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timeout_observer_records_failed_terminal() {
+        let observer = Arc::new(RecordingLifecycleObserver::default());
+        let app = router_for_with_config(
+            Arc::new(SlowBackend),
+            OpenAiFrontendConfig::default()
+                .with_backend_timeout(Duration::from_millis(1))
+                .with_lifecycle_observer(observer.clone()),
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .header("x-request-id", "00000000-0000-4000-8000-000000000022")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let events = observer.events();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                OpenAiLifecycleEvent::Admitted { context },
+                OpenAiLifecycleEvent::BackendDispatched { context: dispatched_context, operation: OpenAiBackendOperation::Models },
+                OpenAiLifecycleEvent::NonStreamTerminal { context: terminal_context, result: OpenAiTerminalResult::Failed { status_code: 504, failure: OpenAiFailure::Timeout } },
+            ] if context.route == OpenAiFrontendRoute::Readyz
+                && context.method == OpenAiRequestMethod::Get
+                && context == dispatched_context
+                && context == terminal_context
+        ));
+    }
+
+    #[tokio::test]
+
     async fn configured_trusted_header_reaches_backend_as_agent_session_identity() {
         let backend = Arc::new(SessionCaptureBackend::default());
         let app = router_for_with_config(
@@ -1201,6 +1578,7 @@ mod tests {
             )
             .await
             .unwrap();
+
         assert_eq!(response.status(), StatusCode::OK);
         let requests = backend.requests.lock().unwrap();
         assert_eq!(requests[0].agent_session(), Some("agent-thread-42"));
@@ -1310,13 +1688,16 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/health")
-                    .header("x-request-id", "client-req-1")
+                    .header("x-request-id", "2a36d783-d345-4a23-87a6-302b3a6896e1")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(response.headers()["x-request-id"], "client-req-1");
+        assert_eq!(
+            response.headers()["x-request-id"],
+            "2a36d783-d345-4a23-87a6-302b3a6896e1"
+        );
 
         let app = router_for(Arc::new(FakeBackend));
         let response = app
@@ -1508,84 +1889,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn non_streaming_timeout_cancels_request_context() {
-        let token = Arc::new(Mutex::new(None));
-        let app = router_for_with_config(
-            Arc::new(NonStreamingCancellationBackend {
-                token: token.clone(),
-            }),
-            OpenAiFrontendConfig::default().with_backend_timeout(Duration::from_millis(5)),
-        );
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/v1/chat/completions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({
-                            "model": "cancel-model",
-                            "messages": [{"role": "user", "content": "hello"}]
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
-        let cancellation = token
-            .lock()
-            .expect("token lock poisoned")
-            .clone()
-            .expect("backend saw request context");
-        assert!(cancellation.is_cancelled());
-    }
-
-    #[tokio::test]
-    async fn dropping_non_streaming_request_cancels_request_context() {
-        let token = Arc::new(Mutex::new(None));
-        let app = router_for_with_config(
-            Arc::new(NonStreamingCancellationBackend {
-                token: token.clone(),
-            }),
-            OpenAiFrontendConfig::default().without_backend_timeout(),
-        );
-        let request = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                json!({
-                    "model": "cancel-model",
-                    "messages": [{"role": "user", "content": "hello"}]
-                })
-                .to_string(),
-            ))
-            .unwrap();
-        let task = tokio::spawn(app.oneshot(request));
-
-        let cancellation = tokio::time::timeout(Duration::from_millis(100), async {
-            loop {
-                if let Some(token) = token.lock().expect("token lock poisoned").clone() {
-                    break token;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("backend received request context");
-        assert!(!cancellation.is_cancelled());
-
-        task.abort();
-        let _ = task.await;
-        tokio::time::timeout(Duration::from_millis(100), cancellation.cancelled())
-            .await
-            .expect("dropped request cancelled backend context");
-    }
-
-    #[tokio::test]
     async fn chat_completion_route_maps_backend_errors() {
         let response = post_json(
             "/v1/chat/completions",
@@ -1738,6 +2041,56 @@ mod tests {
                 .unwrap()
                 .contains("structured output")
         );
+    }
+
+    #[tokio::test]
+    async fn guarded_chat_rescues_tool_call_text() {
+        let backend = Arc::new(GuardrailRescueBackend::default());
+        let app = guarded_test_app(backend.clone());
+
+        let response = post_json_with_app_and_request_id(
+            app,
+            "/v1/chat/completions",
+            json!({
+                "model": "Qwen3-8B-Q4_K_M",
+                "messages": [{"role": "user", "content": "weather"}],
+                "tools": [{"type": "function", "function": {"name": "lookup"}}],
+                "tool_choice": "auto"
+            }),
+            Some("a35bb624-5c07-431f-92a9-9c884472ca95"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["x-request-id"],
+            "a35bb624-5c07-431f-92a9-9c884472ca95"
+        );
+        let body = response_body_json(response).await;
+        assert_eq!(body["object"], "chat.completion");
+        assert!(body["choices"][0]["message"]["content"].is_null());
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "lookup"
+        );
+        assert_eq!(
+            body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"Sydney\"}"
+        );
+        assert!(!serde_json::to_string(&body).unwrap().contains("_mesh_"));
+
+        let seen_requests = backend.seen_chat_requests.lock().unwrap();
+        assert_eq!(seen_requests.len(), 1);
+        let seen_tools = seen_requests[0]
+            .tools
+            .as_ref()
+            .and_then(Value::as_array)
+            .cloned()
+            .expect("guarded backend should receive tools");
+        assert_eq!(seen_tools.len(), 2);
+        assert_eq!(seen_tools[0]["function"]["name"], "lookup");
+        assert_eq!(seen_tools[1]["function"]["name"], "_mesh_respond");
     }
 
     #[tokio::test]

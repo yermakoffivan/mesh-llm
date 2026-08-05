@@ -3,6 +3,7 @@ use super::common::{
 };
 use super::probe::{ResponseProbe, response_is_event_stream, try_parse_response_headers};
 use super::relay::{relay_error_response, relay_success_response};
+use crate::logging::OpenAiRouteObserver;
 use crate::network::openai::response_adapter;
 use crate::network::openai::tool_call_ids::ChatStreamNormalizationState;
 use anyhow::{Context, Result, anyhow};
@@ -55,12 +56,14 @@ pub(in crate::network::openai::response) async fn relay_normalized_chat_completi
     reader: &mut R,
     probe: ResponseProbe,
     retry_policy: ResponseRetryPolicy,
+    route_observer: OpenAiRouteObserver<'_>,
 ) -> Result<RouteAttemptResult> {
     if retry_policy.context_overflow && probe.retryable_context_overflow {
         return Ok(RouteAttemptResult::RetryableContextOverflow);
     }
 
     if !(200..300).contains(&probe.status_code) {
+        route_observer.stream_error("upstream_status");
         return relay_error_response(tcp_stream, reader, probe).await;
     }
 
@@ -75,8 +78,10 @@ pub(in crate::network::openai::response) async fn relay_normalized_chat_completi
     let mut observed_completion_tokens = None;
     let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
     tcp_stream.write_all(header.as_bytes()).await?;
+    route_observer.stream_started(None);
 
     let mut done_seen = false;
+    let mut first_chunk_seen = false;
     loop {
         let mut processed = 0usize;
         while let Some(frame_end_rel) = carry[processed..].find("\n\n") {
@@ -104,6 +109,12 @@ pub(in crate::network::openai::response) async fn relay_normalized_chat_completi
             }
             let normalized = state.normalize_data(&data);
             response_adapter::write_chunked_sse_event(tcp_stream, None, &normalized).await?;
+            if first_chunk_seen {
+                route_observer.stream_chunk();
+            } else {
+                route_observer.stream_first_token();
+                first_chunk_seen = true;
+            }
         }
         if processed > 0 {
             carry = carry[processed..].to_string();
@@ -127,6 +138,7 @@ pub(in crate::network::openai::response) async fn relay_normalized_chat_completi
 
     let _ = tcp_stream.write_all(b"0\r\n\r\n").await;
     let _ = tcp_stream.shutdown().await;
+    route_observer.stream_completed(observed_completion_tokens);
     Ok(RouteAttemptResult::Delivered {
         status_code: probe.status_code,
         completion_tokens: observed_completion_tokens,
@@ -140,6 +152,7 @@ pub(in crate::network::openai::response) async fn relay_translated_responses_str
     reader: &mut R,
     probe: ResponseProbe,
     retry_policy: ResponseRetryPolicy,
+    route_observer: OpenAiRouteObserver<'_>,
 ) -> Result<RouteAttemptResult> {
     fn should_parse_stream_chunk(data: &str, model_missing: bool, usage_missing: bool) -> bool {
         model_missing
@@ -155,6 +168,7 @@ pub(in crate::network::openai::response) async fn relay_translated_responses_str
     }
 
     if !(200..300).contains(&probe.status_code) {
+        route_observer.stream_error("upstream_status");
         return relay_error_response(tcp_stream, reader, probe).await;
     }
 
@@ -164,8 +178,10 @@ pub(in crate::network::openai::response) async fn relay_translated_responses_str
     let mut state = ResponsesStreamRelayState::new();
     let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
     tcp_stream.write_all(header.as_bytes()).await?;
+    route_observer.stream_started(None);
 
     let mut done_seen = false;
+    let mut first_chunk_seen = false;
     loop {
         let mut processed = 0usize;
         while let Some(frame_end_rel) = carry[processed..].find("\n\n") {
@@ -191,6 +207,12 @@ pub(in crate::network::openai::response) async fn relay_translated_responses_str
             }
 
             process_translated_responses_frame(tcp_stream, &mut state, &data).await?;
+            if first_chunk_seen {
+                route_observer.stream_chunk();
+            } else {
+                route_observer.stream_first_token();
+                first_chunk_seen = true;
+            }
         }
         if processed > 0 {
             carry = carry[processed..].to_string();
@@ -217,6 +239,7 @@ pub(in crate::network::openai::response) async fn relay_translated_responses_str
     response_adapter::write_chunked_sse_event(tcp_stream, Some("done"), "[DONE]").await?;
     let _ = tcp_stream.write_all(b"0\r\n\r\n").await;
     let _ = tcp_stream.shutdown().await;
+    route_observer.stream_completed(state.observed_completion_tokens);
     Ok(RouteAttemptResult::Delivered {
         status_code: probe.status_code,
         completion_tokens: state.observed_completion_tokens,
@@ -515,6 +538,7 @@ mod tests {
                 &mut upstream_reader,
                 probe,
                 ResponseRetryPolicy::next_target_available(false),
+                OpenAiRouteObserver::default(),
             )
             .await
             .expect("relay")
@@ -530,7 +554,7 @@ mod tests {
             // tiny gap so the relay actually services the chunk
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
-        let finish = r#"{"id":"chatcmpl-x","object":"chat.completion.chunk","created":1,"model":"qwen","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#;
+        let finish = r#"{"id":"chatcmpl-x","object":"chat.completion.chunk","created":1,"model":"qwen","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":13,"total_tokens":18}}"#;
         upstream_writer
             .write_all(format!("data: {}\n\n", finish).as_bytes())
             .await
@@ -546,7 +570,15 @@ mod tests {
         use tokio::io::AsyncReadExt;
         let mut output = Vec::new();
         client.read_to_end(&mut output).await.unwrap();
-        let _ = server_task.await.expect("server task");
+        let route_result = server_task.await.expect("server task");
+
+        assert_eq!(
+            route_result,
+            RouteAttemptResult::Delivered {
+                status_code: 200,
+                completion_tokens: Some(13),
+            }
+        );
 
         let body = String::from_utf8_lossy(&output);
         let delta_count = body
@@ -560,5 +592,58 @@ mod tests {
             body.contains("\"type\":\"response.completed\""),
             "missing completed event:\n{body}"
         );
+    }
+
+    #[tokio::test]
+    async fn relay_normalized_chat_completion_stream_returns_completion_tokens() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut upstream_writer, mut upstream_reader) = tokio::io::duplex(64 * 1024);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let header = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let server_task = tokio::spawn(async move {
+            let (mut client_socket, _) = listener.accept().await.unwrap();
+            let probe = ResponseProbe {
+                buffered: header.to_vec(),
+                header_end: header.len(),
+                status_code: 200,
+                retryable_context_overflow: false,
+            };
+            relay_normalized_chat_completion_stream(
+                &mut client_socket,
+                &mut upstream_reader,
+                probe,
+                ResponseRetryPolicy::next_target_available(false),
+                OpenAiRouteObserver::default(),
+            )
+            .await
+            .expect("relay")
+        });
+
+        let usage_chunk = r#"{"id":"chatcmpl-y","object":"chat.completion.chunk","created":1,"model":"qwen","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":null}],"usage":{"prompt_tokens":2,"completion_tokens":7,"total_tokens":9}}"#;
+        upstream_writer
+            .write_all(format!("data: {usage_chunk}\n\n").as_bytes())
+            .await
+            .unwrap();
+        upstream_writer
+            .write_all(b"data: {\"id\":\"chatcmpl-y\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"qwen\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+            .await
+            .unwrap();
+        upstream_writer.shutdown().await.unwrap();
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut output = Vec::new();
+        client.read_to_end(&mut output).await.unwrap();
+        let route_result = server_task.await.expect("server task");
+
+        assert_eq!(
+            route_result,
+            RouteAttemptResult::Delivered {
+                status_code: 200,
+                completion_tokens: Some(7),
+            }
+        );
+        assert!(String::from_utf8_lossy(&output).contains("hello"));
     }
 }

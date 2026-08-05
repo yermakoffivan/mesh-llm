@@ -1038,6 +1038,7 @@ mod tests {
         }
 
         for path in [
+            "logging.retention_max_rows",
             "logging.queue_capacity",
             "logging.cleanup_cadence_secs",
             "logging.artifact.capture_mode",

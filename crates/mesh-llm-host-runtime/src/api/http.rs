@@ -24,17 +24,22 @@ pub(super) async fn respond_error(
         409 => "Conflict",
         422 => "Unprocessable Content",
         405 => "Method Not Allowed",
+        406 => "Not Acceptable",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "Unknown",
     };
+    let request_id = super::management_lifecycle::response_request_id_header()
+        .map(|request_id| format!("x-request-id: {request_id}\r\n"))
+        .unwrap_or_default();
     let resp = format!(
-        "HTTP/1.1 {code} {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        "HTTP/1.1 {code} {status}\r\nContent-Type: application/json\r\n{request_id}Content-Length: {}\r\n\r\n{}",
         body.len(),
         body
     );
     stream.write_all(resp.as_bytes()).await?;
+    super::management_lifecycle::record_response_status(code);
     Ok(())
 }
 
@@ -51,18 +56,24 @@ pub(super) async fn respond_json<T: serde::Serialize>(
         400 => "Bad Request",
         403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
+        406 => "Not Acceptable",
         409 => "Conflict",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "OK",
     };
+    let request_id = super::management_lifecycle::response_request_id_header()
+        .map(|request_id| format!("x-request-id: {request_id}\r\n"))
+        .unwrap_or_default();
     let resp = format!(
-        "HTTP/1.1 {code} {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        "HTTP/1.1 {code} {status}\r\nContent-Type: application/json\r\n{request_id}Content-Length: {}\r\n\r\n{}",
         json.len(),
         json
     );
     stream.write_all(resp.as_bytes()).await?;
+    super::management_lifecycle::record_response_status(code);
     Ok(())
 }
 
@@ -88,11 +99,15 @@ pub(super) async fn respond_bytes_cached(
     cache_control: &str,
     body: &[u8],
 ) -> anyhow::Result<()> {
+    let request_id = super::management_lifecycle::response_request_id_header()
+        .map(|request_id| format!("x-request-id: {request_id}\r\n"))
+        .unwrap_or_default();
     let header = format!(
-        "HTTP/1.1 {code} {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: {cache_control}\r\n\r\n",
+        "HTTP/1.1 {code} {status}\r\nContent-Type: {content_type}\r\n{request_id}Content-Length: {}\r\nCache-Control: {cache_control}\r\n\r\n",
         body.len()
     );
     stream.write_all(header.as_bytes()).await?;
     stream.write_all(body).await?;
+    super::management_lifecycle::record_response_status(code);
     Ok(())
 }

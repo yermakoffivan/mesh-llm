@@ -7,17 +7,28 @@ use super::relay::{relay_error_response, relay_success_response};
 use super::stream_translation::{
     relay_normalized_chat_completion_stream, relay_translated_responses_stream,
 };
+use crate::logging::OpenAiRouteObserver;
 use crate::network::openai::request_normalize::ResponseAdapter;
 use anyhow::{Result, anyhow};
+use mesh_llm_events::logging::identifiers::RequestId;
 use tokio::io::AsyncRead;
 use tokio::net::TcpStream;
+
+pub(in crate::network::openai::response) struct RelayAttemptContext<'a> {
+    pub(in crate::network::openai::response) request_id: RequestId,
+    pub(in crate::network::openai::response) disconnect_message: &'a str,
+    pub(in crate::network::openai::response) commit_message: &'a str,
+    pub(in crate::network::openai::response) route_observer: OpenAiRouteObserver<'a>,
+}
 
 pub(in crate::network::openai::response) async fn relay_probed_response<R: AsyncRead + Unpin>(
     tcp_stream: &mut TcpStream,
     reader: &mut R,
     probe: ResponseProbe,
+    _request_id: RequestId,
     retry_policy: ResponseRetryPolicy,
     response_adapter: ResponseAdapter,
+    route_observer: OpenAiRouteObserver<'_>,
 ) -> Result<RouteAttemptResult> {
     if let Some(result) = relay_adapted_response(
         tcp_stream,
@@ -25,6 +36,7 @@ pub(in crate::network::openai::response) async fn relay_probed_response<R: Async
         probe.clone(),
         retry_policy,
         response_adapter,
+        route_observer,
     )
     .await?
     {
@@ -49,20 +61,34 @@ async fn relay_adapted_response<R: AsyncRead + Unpin>(
     probe: ResponseProbe,
     retry_policy: ResponseRetryPolicy,
     response_adapter: ResponseAdapter,
+    route_observer: OpenAiRouteObserver<'_>,
 ) -> Result<Option<RouteAttemptResult>> {
     match response_adapter {
         ResponseAdapter::OpenAiChatCompletionsJson => Ok(Some(
             relay_normalized_chat_completion_json(tcp_stream, reader, probe, retry_policy).await?,
         )),
         ResponseAdapter::OpenAiChatCompletionsStream => Ok(Some(
-            relay_normalized_chat_completion_stream(tcp_stream, reader, probe, retry_policy)
-                .await?,
+            relay_normalized_chat_completion_stream(
+                tcp_stream,
+                reader,
+                probe,
+                retry_policy,
+                route_observer,
+            )
+            .await?,
         )),
         ResponseAdapter::OpenAiResponsesJson => Ok(Some(
             relay_translated_responses_json(tcp_stream, reader, probe, retry_policy).await?,
         )),
         ResponseAdapter::OpenAiResponsesStream => Ok(Some(
-            relay_translated_responses_stream(tcp_stream, reader, probe, retry_policy).await?,
+            relay_translated_responses_stream(
+                tcp_stream,
+                reader,
+                probe,
+                retry_policy,
+                route_observer,
+            )
+            .await?,
         )),
         ResponseAdapter::None => Ok(None),
     }
@@ -72,24 +98,47 @@ pub(in crate::network::openai::response) async fn relay_attempted_response<R: As
     tcp_stream: &mut TcpStream,
     reader: &mut R,
     probe: ResponseProbe,
+    context: RelayAttemptContext<'_>,
     retry_policy: ResponseRetryPolicy,
     response_adapter: ResponseAdapter,
-    disconnect_message: &str,
-    commit_message: &str,
 ) -> RouteAttemptResult {
     let status_code = probe.status_code;
-    match relay_probed_response(tcp_stream, reader, probe, retry_policy, response_adapter).await {
+    match relay_probed_response(
+        tcp_stream,
+        reader,
+        probe,
+        context.request_id,
+        retry_policy,
+        response_adapter,
+        context.route_observer,
+    )
+    .await
+    {
         Ok(result) => result,
         Err(err) => {
+            if is_streaming_response_adapter(response_adapter) {
+                if is_client_disconnect_error(&err) {
+                    context.route_observer.stream_cancelled();
+                } else {
+                    context.route_observer.stream_error("stream_relay_failed");
+                }
+            }
             if is_client_disconnect_error(&err) {
-                tracing::info!("{disconnect_message}");
+                tracing::info!("{}", context.disconnect_message);
                 return RouteAttemptResult::ClientDisconnected;
             }
-            tracing::debug!("{commit_message}: {err}");
+            tracing::debug!("{}: {err}", context.commit_message);
             RouteAttemptResult::Delivered {
                 status_code,
                 completion_tokens: None,
             }
         }
     }
+}
+
+const fn is_streaming_response_adapter(response_adapter: ResponseAdapter) -> bool {
+    matches!(
+        response_adapter,
+        ResponseAdapter::OpenAiChatCompletionsStream | ResponseAdapter::OpenAiResponsesStream
+    )
 }

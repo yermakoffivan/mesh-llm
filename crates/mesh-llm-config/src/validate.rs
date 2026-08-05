@@ -380,6 +380,12 @@ fn validate_logging_config(config: &crate::LoggingConfig) -> Vec<ConfigDiagnosti
             3600,      // minimum 1 hour
             7_776_000, // maximum 90 days
         ),
+        (
+            "logging.retention_max_rows",
+            config.retention_max_rows,
+            1,
+            1_000_000,
+        ),
     ] {
         if !(min..=max).contains(&value) {
             diagnostics.push(validation_diagnostic(
@@ -527,10 +533,31 @@ fn validate_webhook_config(
     config: &crate::LoggingWebhookConfig,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) {
-    if let Some(ref url) = config.url
-        && let Err(diag) = validate_optional_http_url(Some(url), "logging.webhook.url")
-    {
-        diagnostics.push(diag);
+    let configured_url = config
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty());
+    if config.enabled && configured_url.is_none() {
+        diagnostics.push(validation_diagnostic(
+            "logging.webhook.url",
+            "logging.webhook.url is required when logging.webhook.enabled is true",
+        ));
+    }
+    if let Some(url) = configured_url {
+        if let Err(diag) = validate_optional_http_url(Some(url), "logging.webhook.url") {
+            diagnostics.push(diag);
+        } else if let Ok(parsed) = url::Url::parse(url)
+            && (!parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some())
+        {
+            diagnostics.push(validation_diagnostic(
+                "logging.webhook.url",
+                "logging.webhook.url must not include credentials, a query string, or a fragment",
+            ));
+        }
     }
 
     for (path, value, min, max) in [
@@ -845,6 +872,7 @@ bind_addr = "0.0.0.0"
         assert_eq!(config.logging.summary_line_limit, 2048);
         assert_eq!(config.logging.event_buffer_size, 10_000);
         assert_eq!(config.logging.retention_ttl_secs, 36 * 3600); // 36 hours
+        assert_eq!(config.logging.retention_max_rows, 100_000);
         assert_eq!(config.logging.replay_capacity, 128);
         assert_eq!(config.logging.queue_capacity, 4096);
         assert_eq!(config.logging.export_limit_bytes, 5 * 1024 * 1024); // 5 MB
@@ -859,5 +887,54 @@ bind_addr = "0.0.0.0"
 
         // Webhook disabled by default.
         assert!(!config.logging.webhook.enabled);
+    }
+
+    #[test]
+    fn logging_retention_max_rows_reports_a_stable_validation_path() {
+        let mut config = crate::MeshConfig::default();
+        config.logging.retention_max_rows = 0;
+
+        let diagnostics = validate_config_diagnostics(&config);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .path
+                .as_ref()
+                .is_some_and(|path| path.render() == "logging.retention_max_rows")
+                && diagnostic.message.contains("must be between 1 and 1000000")
+        }));
+    }
+
+    #[test]
+    fn enabled_webhook_requires_a_plain_http_url_without_secret_components() {
+        let mut config = crate::MeshConfig::default();
+        config.logging.webhook.enabled = true;
+
+        let diagnostics = validate_config_diagnostics(&config);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .path
+                .as_ref()
+                .is_some_and(|path| path.render() == "logging.webhook.url")
+                && diagnostic.message.contains("required")
+        }));
+
+        config.logging.webhook.url =
+            Some("https://operator:secret@example.invalid/hook?token=secret#fragment".into());
+        let diagnostics = validate_config_diagnostics(&config);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .path
+                .as_ref()
+                .is_some_and(|path| path.render() == "logging.webhook.url")
+                && diagnostic.message.contains("must not include credentials")
+        }));
+        assert!(diagnostics.iter().all(|diagnostic| {
+            !diagnostic.message.contains("operator")
+                && !diagnostic.message.contains("secret")
+                && !diagnostic.message.contains("example.invalid")
+        }));
+
+        config.logging.webhook.url = Some("http://127.0.0.1:4567/hook".into());
+        assert!(validate_config_diagnostics(&config).is_empty());
     }
 }

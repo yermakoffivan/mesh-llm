@@ -1,6 +1,17 @@
 use crate::inference::election;
+use crate::logging::OpenAiRouteObserver;
+use crate::network::openai::request_normalize::ResponseAdapter;
 use crate::network::openai::response_quality::{self, ResponseQualityFailure};
 use crate::network::target_health::TargetHealthOutcome;
+use mesh_llm_events::logging::identifiers::RequestId;
+
+#[derive(Clone, Copy)]
+pub(in crate::network::openai) struct RouteAttemptLoggingContext<'a> {
+    pub(in crate::network::openai) request_id: RequestId,
+    pub(in crate::network::openai) retry_policy: ResponseRetryPolicy,
+    pub(in crate::network::openai) response_adapter: ResponseAdapter,
+    pub(in crate::network::openai) route_observer: OpenAiRouteObserver<'a>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::network::openai) enum RouteAttemptResult {

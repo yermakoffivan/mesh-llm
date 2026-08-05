@@ -1068,6 +1068,7 @@ fn logging_settings() -> Vec<ConfigSettingSchema> {
         logging_setting("logging.event_buffer_size", ConfigValueSchema::Integer),
         // Only these two limits have a dynamic service-application contract.
         logging_dynamic_setting("logging.retention_ttl_secs", ConfigValueSchema::Integer),
+        logging_setting("logging.retention_max_rows", ConfigValueSchema::Integer),
         logging_dynamic_setting("logging.replay_capacity", ConfigValueSchema::Integer),
         logging_setting("logging.queue_capacity", ConfigValueSchema::Integer),
         logging_setting("logging.cleanup_cadence_secs", ConfigValueSchema::Integer),
@@ -1420,6 +1421,7 @@ mod tests {
             "logging.application_state_root",
             "logging.summary_line_limit",
             "logging.event_buffer_size",
+            "logging.retention_max_rows",
             "logging.queue_capacity",
             "logging.cleanup_cadence_secs",
             "logging.artifact.capture_mode",

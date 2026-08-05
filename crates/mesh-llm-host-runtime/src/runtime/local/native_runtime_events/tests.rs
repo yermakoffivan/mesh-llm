@@ -36,9 +36,8 @@ impl Drop for OutputSinkResetGuard {
 
 #[test]
 fn native_model_open_finished_translates_to_info_without_readiness_events() {
-    let translated = translate_skippy_native_runtime_event_snapshot(
-        "model-a",
-        SkippyNativeRuntimeEventSnapshot {
+    let translated =
+        translate_skippy_native_runtime_event_snapshot(SkippyNativeRuntimeEventSnapshot {
             kind: SkippyNativeRuntimeEventKind::ModelOpenFinished,
             sequence: 7,
             status: "Ok",
@@ -46,10 +45,8 @@ fn native_model_open_finished_translates_to_info_without_readiness_events() {
             progress_current: 500,
             progress_total: 1000,
             progress_unit: SkippyNativeRuntimeProgressUnit::Steps,
-            detail: Some("Metal GPU 0"),
-        },
-    )
-    .expect("finished event should produce output visibility");
+        })
+        .expect("finished event should produce output visibility");
 
     match translated {
         OutputEvent::Info { message, context } => {
@@ -66,9 +63,8 @@ fn native_model_open_finished_translates_to_info_without_readiness_events() {
 
 #[test]
 fn native_model_open_progress_translates_to_percentage_visibility() {
-    let translated = translate_skippy_native_runtime_event_snapshot(
-        "model-a",
-        SkippyNativeRuntimeEventSnapshot {
+    let translated =
+        translate_skippy_native_runtime_event_snapshot(SkippyNativeRuntimeEventSnapshot {
             kind: SkippyNativeRuntimeEventKind::ModelOpenProgress,
             sequence: 7,
             status: "Ok",
@@ -76,14 +72,12 @@ fn native_model_open_progress_translates_to_percentage_visibility() {
             progress_current: 500,
             progress_total: 1000,
             progress_unit: SkippyNativeRuntimeProgressUnit::Steps,
-            detail: Some("Metal GPU 0"),
-        },
-    )
-    .expect("progress event should produce output visibility");
+        })
+        .expect("progress event should produce output visibility");
 
     match translated {
         OutputEvent::Info { message, .. } => {
-            assert!(message.contains("Opening model 'model-a' 50%"));
+            assert!(message.contains("Opening native model 50%"));
         }
         other => panic!("expected info event, got {other:?}"),
     }
@@ -91,9 +85,8 @@ fn native_model_open_progress_translates_to_percentage_visibility() {
 
 #[test]
 fn native_model_open_handled_failure_translates_to_warning_without_readiness_events() {
-    let translated = translate_skippy_native_runtime_event_snapshot(
-        "model-a",
-        SkippyNativeRuntimeEventSnapshot {
+    let translated =
+        translate_skippy_native_runtime_event_snapshot(SkippyNativeRuntimeEventSnapshot {
             kind: SkippyNativeRuntimeEventKind::ModelOpenFailedHandled,
             sequence: 8,
             status: "Err",
@@ -101,10 +94,8 @@ fn native_model_open_handled_failure_translates_to_warning_without_readiness_eve
             progress_current: 0,
             progress_total: 0,
             progress_unit: SkippyNativeRuntimeProgressUnit::Steps,
-            detail: Some("simulated native error"),
-        },
-    )
-    .expect("handled failure should still produce output visibility");
+        })
+        .expect("handled failure should still produce output visibility");
 
     match translated {
         OutputEvent::Warning { message, context } => {
@@ -112,7 +103,7 @@ fn native_model_open_handled_failure_translates_to_warning_without_readiness_eve
             assert!(
                 context
                     .as_deref()
-                    .is_some_and(|value| value.contains("detail=simulated native error"))
+                    .is_some_and(|value| value.contains("sequence=8"))
             );
         }
         other => panic!("expected warning event, got {other:?}"),
@@ -125,7 +116,8 @@ fn native_model_open_reporter_emits_visibility_only_events() {
     let _reset_guard = OutputSinkResetGuard;
     set_output_sink(sink.clone());
 
-    let mut reporter = skippy_native_model_open_event_reporter("model-a".to_string());
+    let mut reporter =
+        skippy_native_model_open_event_reporter("/private/models/model-a.gguf".to_string());
     for kind in [
         SkippyNativeRuntimeEventKind::ModelOpenStarted,
         SkippyNativeRuntimeEventKind::ModelOpenProgress,
@@ -151,7 +143,7 @@ fn native_model_open_reporter_emits_visibility_only_events() {
                 skippy_runtime::RuntimeEventFailureCode::None
             },
             status: skippy_runtime::Status::Ok,
-            detail_bytes: b"Metal GPU 0".to_vec(),
+            detail_bytes: b"prompt=private native detail".to_vec(),
         });
     }
 
@@ -161,8 +153,7 @@ fn native_model_open_reporter_emits_visibility_only_events() {
         .filter(|event| {
             matches!(
                 event,
-                OutputEvent::Info { message, .. } | OutputEvent::Warning { message, .. }
-                    if message.contains("'model-a'")
+                OutputEvent::Info { .. } | OutputEvent::Warning { .. }
             )
         })
         .collect::<Vec<_>>();
@@ -189,4 +180,35 @@ fn native_model_open_reporter_emits_visibility_only_events() {
                 | OutputEvent::RuntimeReady { .. }
         )
     }));
+    let serialized = format!("{events:?}");
+    for raw_value in [
+        "/private/models/model-a.gguf",
+        "prompt=private native detail",
+    ] {
+        assert!(
+            !serialized.contains(raw_value),
+            "native presentation must not include {raw_value}"
+        );
+    }
+}
+
+#[test]
+fn native_model_open_callbacks_map_only_static_operational_transitions() {
+    assert_eq!(
+        [
+            SkippyNativeRuntimeEventKind::ModelOpenStarted,
+            SkippyNativeRuntimeEventKind::ModelOpenProgress,
+            SkippyNativeRuntimeEventKind::BackendDeviceSelected,
+            SkippyNativeRuntimeEventKind::ModelOpenFinished,
+            SkippyNativeRuntimeEventKind::ModelOpenFailedHandled,
+        ]
+        .into_iter()
+        .filter_map(native_skippy_operational_event)
+        .collect::<Vec<_>>(),
+        vec![
+            NativeSkippyOperationalEvent::ModelOpenStarted,
+            NativeSkippyOperationalEvent::ModelOpenFinished,
+            NativeSkippyOperationalEvent::ModelOpenFailed,
+        ]
+    );
 }

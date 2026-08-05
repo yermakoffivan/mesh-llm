@@ -1034,6 +1034,15 @@ fn artifact_cascade_cleanup_deletes_artifact_files() {
         "INSERT INTO lifecycle_events (event_id, request_id, occurred_at, payload_json) VALUES (?, ?, ?, ?)",
         rusqlite::params!["ev-mar-1", "req-mar", "2025-03-15T00:00:00Z", r#"{"type":"admitted"}"#],
     ).unwrap();
+    store
+        .write_terminal_event(
+            "req-jan",
+            "ev-jan-terminal",
+            r#"{"type":"completed"}"#,
+            "completed",
+            "2025-01-15T00:00:00Z",
+        )
+        .unwrap();
 
     let afs_root = tempfile::tempdir().expect("artifact root");
     let afs = ArtifactFileStore::open(afs_root.path().to_path_buf(), clock.clone(), store).unwrap();
@@ -1053,7 +1062,6 @@ fn artifact_cascade_cleanup_deletes_artifact_files() {
         8192,
     )
     .unwrap();
-
     // Need a new store reference to write for req-mar (same store).
     afs.write_artifact(
         "art-mar",

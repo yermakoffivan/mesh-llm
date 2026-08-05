@@ -3,7 +3,7 @@
 use rusqlite::Connection;
 
 /// Current schema version (incremented with each migration).
-pub const CURRENT_VERSION: u32 = 3;
+pub const CURRENT_VERSION: u32 = 10;
 
 const MIGRATIONS_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS summaries (
@@ -136,7 +136,124 @@ WHERE payload_json LIKE '%"type":"completed"%'
    OR payload_json LIKE '%"type":"dropped"%';
 "#;
 
-/// Apply all pending migrations. Uses execute_batch which handles multi-statement strings in SQLite.
+const MIGRATIONS_V4: &str = r#"
+CREATE TABLE IF NOT EXISTS maintenance_operations (
+    operation_id TEXT PRIMARY KEY,
+    action TEXT NOT NULL,
+    cutoff_before TEXT NOT NULL,
+    request_limit INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    state TEXT NOT NULL,
+    planned_requests INTEGER NOT NULL,
+    planned_events INTEGER NOT NULL,
+    planned_artifacts INTEGER NOT NULL,
+    planned_proxy_records INTEGER NOT NULL,
+    planned_database_rows INTEGER NOT NULL,
+    executed_requests INTEGER NOT NULL DEFAULT 0,
+    executed_events INTEGER NOT NULL DEFAULT 0,
+    executed_artifacts INTEGER NOT NULL DEFAULT 0,
+    executed_proxy_records INTEGER NOT NULL DEFAULT 0,
+    executed_database_rows INTEGER NOT NULL DEFAULT 0,
+    has_more INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS maintenance_operation_targets (
+    operation_id TEXT NOT NULL REFERENCES maintenance_operations(operation_id) ON DELETE CASCADE,
+    ordinal INTEGER NOT NULL,
+    request_id TEXT NOT NULL,
+    PRIMARY KEY (operation_id, request_id),
+    UNIQUE (operation_id, ordinal)
+);
+
+CREATE INDEX IF NOT EXISTS idx_maintenance_operation_targets_operation
+ON maintenance_operation_targets (operation_id, ordinal);
+"#;
+
+const MIGRATIONS_V5: &str = r#"
+ALTER TABLE maintenance_operations ADD COLUMN selection_fingerprint TEXT NOT NULL DEFAULT '';
+"#;
+
+const MIGRATIONS_V6: &str = r#"
+ALTER TABLE maintenance_operations ADD COLUMN artifact_files_removed INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE maintenance_operations ADD COLUMN artifact_files_failed INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE maintenance_operations ADD COLUMN artifact_file_failure_class TEXT;
+"#;
+
+// Webhook delivery is a durable state machine, not a request-path side effect.
+// The v1 columns are retained for forward-only compatibility but are scrubbed:
+// an endpoint, response body, or raw transport error must never survive in a
+// local logging record. New repository methods use only the v7 fields below.
+const MIGRATIONS_V7: &str = r#"
+ALTER TABLE webhook_deliveries ADD COLUMN state TEXT NOT NULL DEFAULT 'succeeded';
+ALTER TABLE webhook_deliveries ADD COLUMN created_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE webhook_deliveries ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE webhook_deliveries ADD COLUMN next_attempt_at TEXT;
+ALTER TABLE webhook_deliveries ADD COLUMN lease_expires_at TEXT;
+ALTER TABLE webhook_deliveries ADD COLUMN claim_generation INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE webhook_deliveries ADD COLUMN max_attempts INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE webhook_deliveries ADD COLUMN last_error_code TEXT;
+
+UPDATE webhook_deliveries
+SET target_url = 'configured_webhook',
+    response_body = NULL,
+    error_msg = NULL,
+    created_at = occurred_at,
+    updated_at = occurred_at,
+    state = CASE
+        WHEN status_code BETWEEN 200 AND 299 THEN 'succeeded'
+        ELSE 'dead_letter'
+    END,
+    max_attempts = CASE
+        WHEN attempt_number > 0 THEN attempt_number
+        ELSE 1
+    END;
+
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_eligible
+ON webhook_deliveries (state, next_attempt_at, lease_expires_at, created_at, delivery_id);
+"#;
+
+// Lifecycle terminal detection must not inspect serialized payload text. The
+// typed columns preserve a queryable event classification while the payload
+// remains available to the existing event-query API.
+const MIGRATIONS_V8: &str = r#"
+ALTER TABLE lifecycle_events ADD COLUMN event_type TEXT NOT NULL DEFAULT 'unknown';
+ALTER TABLE lifecycle_events ADD COLUMN is_terminal INTEGER NOT NULL DEFAULT 0
+    CHECK (is_terminal IN (0, 1));
+
+UPDATE lifecycle_events
+SET event_type = CASE
+        WHEN json_valid(payload_json) THEN COALESCE(json_extract(payload_json, '$.type'), 'unknown')
+        ELSE 'unknown'
+    END,
+    is_terminal = CASE
+        WHEN json_valid(payload_json)
+         AND json_extract(payload_json, '$.type') IN ('completed', 'failed', 'rejected', 'cancelled', 'dropped')
+        THEN 1
+        ELSE 0
+    END;
+
+DROP INDEX IF EXISTS idx_terminal_event_one_per_request;
+CREATE UNIQUE INDEX idx_terminal_event_one_per_request
+ON lifecycle_events (request_id)
+WHERE is_terminal = 1;
+
+CREATE INDEX IF NOT EXISTS idx_lifecycle_events_request_terminal
+ON lifecycle_events (request_id, is_terminal);
+"#;
+
+const MIGRATIONS_V9: &str = r#"
+ALTER TABLE maintenance_operations ADD COLUMN preview_audit_id TEXT;
+ALTER TABLE maintenance_operations ADD COLUMN execution_audit_id TEXT;
+"#;
+
+const MIGRATIONS_V10: &str = r#"
+ALTER TABLE maintenance_operations ADD COLUMN cleanup_filters_json TEXT NOT NULL DEFAULT '{}';
+"#;
+
+/// Apply all pending migrations, committing each schema step with its version
+/// marker as one SQLite transaction.
 pub fn apply_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
     let current_ver: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
 
@@ -144,19 +261,33 @@ pub fn apply_migrations(conn: &Connection) -> Result<(), rusqlite::Error> {
         return Ok(()); // already up-to-date
     }
 
-    if current_ver < 1 {
-        conn.execute_batch(MIGRATIONS_V1)?;
+    for (version, migration) in [
+        (1, MIGRATIONS_V1),
+        (2, MIGRATIONS_V2),
+        (3, MIGRATIONS_V3),
+        (4, MIGRATIONS_V4),
+        (5, MIGRATIONS_V5),
+        (6, MIGRATIONS_V6),
+        (7, MIGRATIONS_V7),
+        (8, MIGRATIONS_V8),
+        (9, MIGRATIONS_V9),
+        (10, MIGRATIONS_V10),
+    ] {
+        if current_ver < version {
+            apply_migration_transactionally(conn, version, migration)?;
+        }
     }
-
-    if current_ver < 2 {
-        conn.execute_batch(MIGRATIONS_V2)?;
-    }
-
-    if current_ver < 3 {
-        conn.execute_batch(MIGRATIONS_V3)?;
-    }
-
-    conn.execute_batch(&format!("PRAGMA user_version = {}", CURRENT_VERSION))?;
 
     Ok(())
+}
+
+fn apply_migration_transactionally(
+    conn: &Connection,
+    version: i32,
+    migration: &str,
+) -> Result<(), rusqlite::Error> {
+    let transaction = conn.unchecked_transaction()?;
+    transaction.execute_batch(migration)?;
+    transaction.execute_batch(&format!("PRAGMA user_version = {version}"))?;
+    transaction.commit()
 }

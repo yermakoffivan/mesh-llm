@@ -485,6 +485,7 @@ pub(crate) mod tests {
             first_joined_mesh_ts: Some(123),
             mesh_requirements: None,
             recent_mesh_rejections: vec![],
+            logging: None,
         };
 
         assert_eq!(
@@ -1491,7 +1492,11 @@ pub(crate) mod tests {
             Some("glm"),
             election::InferenceTarget::Local(upstream_port),
             b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\n\r\n{}",
-            ResponseAdapter::None,
+            crate::network::openai::transport::RouteTargetContext {
+                request_id: mesh_llm_events::logging::identifiers::RequestId::default(),
+                response_adapter: ResponseAdapter::None,
+                route_observer: crate::logging::OpenAiRouteObserver::default(),
+            },
         )
         .await;
 

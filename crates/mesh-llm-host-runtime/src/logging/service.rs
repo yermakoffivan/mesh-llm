@@ -11,8 +11,9 @@ use std::time::Duration;
 use mesh_llm_events::logging::envelope::CanonicalEnvelope;
 use mesh_llm_events::logging::events::LifecycleEvent;
 use mesh_llm_events::logging::identifiers::{AttemptId, EventId, RequestId};
+use mesh_llm_events::logging::proxy::ProxyRecord;
 
-use mesh_llm_events::logging::replay::ReplayChannel;
+use mesh_llm_events::logging::replay::{ReplayChannel, ReplaySequence};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::{AbortHandle, JoinHandle};
 
@@ -23,7 +24,13 @@ pub use super::bus::{BusEntry, ReplayBus};
 use super::lifecycle::LifecycleRecorder;
 pub use super::lifecycle::{DuplicateTerminalError, LifecycleGuard, TerminalOutcome};
 use super::limits::{DynamicLoggingLimits, LoggingDynamicLimits};
+use super::metrics::{
+    LoggingArtifactCaptureStatus, LoggingCleanupOutcome, LoggingMetric, LoggingMetrics,
+    LoggingMetricsSink, LoggingTerminalOutcome,
+};
+use super::registry::RequestSummaryEventSnapshots;
 pub use super::registry::{RegistryConfig, RequestRegistry, RequestSummaryEntry};
+use super::request_metadata::RequestSummaryMetadata;
 pub use super::sequences::SequenceGenerators;
 pub use super::writer::FailOpenWriter;
 
@@ -115,12 +122,20 @@ impl Default for ServiceConfig {
 /// Internal message sent from the service to the persistence worker via mpsc channel.
 #[derive(Debug)]
 enum WorkerMessage {
-    /// Persist a bus entry (serialized event payload).
-    PersistBusEntry(BusEntry),
+    /// Persist one accepted entry through the service-owned delivery path.
+    Persist(PersistenceEntry),
     /// Drain every preceding entry, acknowledge the drain, then exit. The
     /// control message is queued behind normal work so the acknowledgement is
     /// a precise durability boundary for the bounded worker channel.
     Shutdown(oneshot::Sender<()>),
+}
+
+/// One durable record accepted by the logging service. Proxy attempts are
+/// observational records, so they do not enter the lifecycle replay bus.
+#[derive(Debug)]
+enum PersistenceEntry {
+    Bus(BusEntry),
+    ProxyRecord(String),
 }
 
 /// The one owner of an accepted entry's persistence hand-off.
@@ -133,7 +148,7 @@ enum DeliveryMode {
     /// No worker is running. Entries are retained for an explicit
     /// [`LoggingService::pump_sync`] call or handed to the first worker.
     Manual {
-        pending: VecDeque<BusEntry>,
+        pending: VecDeque<PersistenceEntry>,
         capacity: usize,
     },
     /// A `pump_sync` task owns entries that were atomically removed from the
@@ -148,6 +163,26 @@ enum DeliveryMode {
     /// The previous worker is joined. New events still reach replay, but their
     /// persistence hand-off is counted as unavailable until a later spawn.
     Stopped,
+}
+
+/// Path-free local state of the persistence delivery owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PersistenceWorkerState {
+    NotStarted,
+    Running,
+    Stopping,
+    Stopped,
+}
+
+impl PersistenceWorkerState {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::NotStarted => "not_started",
+            Self::Running => "running",
+            Self::Stopping => "stopping",
+            Self::Stopped => "stopped",
+        }
+    }
 }
 
 struct ManualPumpCompletion {
@@ -190,6 +225,10 @@ pub struct LoggingService {
     /// Bounded replay bus for nonblocking enqueue with drop-oldest overflow policy.
     bus: Arc<ReplayBus>,
 
+    /// Process-local optional metrics adapter. Logging owns this closed
+    /// vocabulary and never depends on an OTLP implementation.
+    metrics: LoggingMetrics,
+
     /// Sequence generators per ReplayChannel (monotonic, shared across clones).
     sequences: SequenceGenerators,
 
@@ -223,6 +262,12 @@ pub struct LoggingService {
 
     /// Whether spawn() has been called (prevents double-spawn).
     spawned: Arc<AtomicBool>,
+
+    /// A retired runtime state must never be able to resurrect a persistence
+    /// worker through an `Arc<LoggingService>` captured by an earlier runtime
+    /// invocation. Retirement is permanent for this service instance; a new
+    /// process-local runtime receives a new service.
+    startable: AtomicBool,
 
     /// Accepted entries that could not be handed to the bounded persistence
     /// channel. This intentionally excludes replay-window evictions.
@@ -265,6 +310,8 @@ pub struct LoggingService {
 #[derive(Clone)]
 struct EventDelivery {
     bus: Arc<ReplayBus>,
+    registry: Arc<RequestRegistry>,
+    metrics: LoggingMetrics,
     sequences: SequenceGenerators,
     sink_enabled: bool,
     clock: Arc<dyn Clock>,
@@ -275,7 +322,42 @@ struct EventDelivery {
 
 impl EventDelivery {
     fn enqueue(&self, request_id: RequestId, channel: ReplayChannel, payload_json: String) {
-        let _ = enqueue_event_with_delivery(self, request_id, channel, payload_json);
+        self.enqueue_with_summary_snapshots(request_id, channel, payload_json, None);
+    }
+
+    fn enqueue_with_summary_snapshots(
+        &self,
+        request_id: RequestId,
+        channel: ReplayChannel,
+        payload_json: String,
+        summary_snapshots: Option<RequestSummaryEventSnapshots>,
+    ) {
+        let _ =
+            enqueue_event_with_delivery(self, request_id, channel, payload_json, summary_snapshots);
+    }
+
+    fn enqueue_audit(&self, level: &'static str, message: &'static str) {
+        let entry = BusEntry {
+            payload: serde_json::json!({
+                "kind": "audit",
+                "level": level,
+                "message": message,
+            })
+            .to_string(),
+            channel_hint: 2,
+        };
+        let outcome = self
+            .bus
+            .push_with_hint(entry.payload.clone(), entry.channel_hint);
+        if self.sink_enabled && !matches!(outcome, super::bus::PushOutcome::Rejected) {
+            offer_persistence_to(
+                &self.delivery,
+                &self.persistence_queue_drops,
+                &self.persistence_outstanding,
+                &self.metrics,
+                PersistenceEntry::Bus(entry),
+            );
+        }
     }
 }
 
@@ -286,17 +368,36 @@ struct ServiceLifecycleRecorder {
 
 impl LifecycleRecorder for ServiceLifecycleRecorder {
     fn record_terminal(&self, request_id: RequestId, outcome: TerminalOutcome) {
+        self.event_delivery
+            .metrics
+            .record(LoggingMetric::LifecycleTerminal {
+                outcome: logging_terminal_outcome(&outcome),
+            });
         let request_id_string = request_id.as_uuid().to_string();
-        if let Some(mut entry) = self.registry.get_active(&request_id_string) {
-            entry.state = outcome.as_str().into();
-            entry.terminal_at = Some(self.event_delivery.clock.now());
-            self.registry.move_to_recent(entry);
-        }
+        let summary_snapshots = self.registry.terminalize(
+            &request_id_string,
+            outcome.as_str(),
+            self.event_delivery.clock.now(),
+        );
 
         if let Ok(payload) = serde_json::to_string(&terminal_lifecycle_event(&outcome)) {
-            self.event_delivery
-                .enqueue(request_id, ReplayChannel::Requests, payload);
+            self.event_delivery.enqueue_with_summary_snapshots(
+                request_id,
+                ReplayChannel::Requests,
+                payload,
+                summary_snapshots,
+            );
         }
+    }
+}
+
+fn logging_terminal_outcome(outcome: &TerminalOutcome) -> LoggingTerminalOutcome {
+    match outcome {
+        TerminalOutcome::Completed => LoggingTerminalOutcome::Completed,
+        TerminalOutcome::Failed(_) => LoggingTerminalOutcome::Failed,
+        TerminalOutcome::Rejected(_) => LoggingTerminalOutcome::Rejected,
+        TerminalOutcome::Cancelled(_) => LoggingTerminalOutcome::Cancelled,
+        TerminalOutcome::Dropped(_) => LoggingTerminalOutcome::Dropped,
     }
 }
 
@@ -326,6 +427,7 @@ fn enqueue_event_with_delivery(
     request_id: RequestId,
     channel: ReplayChannel,
     payload_json: String,
+    summary_snapshots: Option<RequestSummaryEventSnapshots>,
 ) -> EventId {
     let sequence = event_delivery.sequences.next(channel);
     let occurred_at = event_delivery.clock.now();
@@ -359,6 +461,23 @@ fn enqueue_event_with_delivery(
         );
         entry_object.insert("canonical_envelope".into(), serde_json::json!(envelope));
     }
+    let request_id_string = request_id.as_uuid().to_string();
+    let summary_snapshots = summary_snapshots.or_else(|| {
+        event_delivery
+            .registry
+            .get_active(&request_id_string)
+            .or_else(|| event_delivery.registry.get_recent(&request_id_string))
+            .map(|entry| RequestSummaryEventSnapshots::current(&entry))
+    });
+    if let Some(summary_snapshots) = summary_snapshots {
+        entry
+            .as_object_mut()
+            .expect("logging bus entry is always a JSON object")
+            .insert(
+                "request_summary_snapshots".into(),
+                serde_json::json!(summary_snapshots),
+            );
+    }
     let entry_payload = entry.to_string();
     let channel_hint = match channel {
         ReplayChannel::Requests => 0,
@@ -369,15 +488,18 @@ fn enqueue_event_with_delivery(
         payload: entry_payload,
         channel_hint,
     };
-    let outcome = event_delivery
-        .bus
-        .push_with_hint(entry.payload.clone(), entry.channel_hint);
+    let outcome = event_delivery.bus.push_replay(
+        entry.payload.clone(),
+        entry.channel_hint,
+        ReplaySequence::next(channel, sequence),
+    );
     if event_delivery.sink_enabled && !matches!(outcome, super::bus::PushOutcome::Rejected) {
         offer_persistence_to(
             &event_delivery.delivery,
             &event_delivery.persistence_queue_drops,
             &event_delivery.persistence_outstanding,
-            entry,
+            &event_delivery.metrics,
+            PersistenceEntry::Bus(entry),
         );
     }
     event_id
@@ -387,6 +509,7 @@ fn offer_summary_persistence(
     delivery: &Mutex<DeliveryMode>,
     persistence_queue_drops: &AtomicU64,
     persistence_outstanding: &AtomicU64,
+    metrics: &LoggingMetrics,
     summary: RequestSummaryEntry,
 ) {
     let payload = match serde_json::to_string(&serde_json::json!({
@@ -395,7 +518,7 @@ fn offer_summary_persistence(
     })) {
         Ok(payload) => payload,
         Err(_) => {
-            persistence_queue_drops.fetch_add(1, Ordering::Relaxed);
+            record_persistence_queue_drop(persistence_queue_drops, metrics);
             return;
         }
     };
@@ -403,10 +526,11 @@ fn offer_summary_persistence(
         delivery,
         persistence_queue_drops,
         persistence_outstanding,
-        BusEntry {
+        metrics,
+        PersistenceEntry::Bus(BusEntry {
             payload,
             channel_hint: 0,
-        },
+        }),
     );
 }
 
@@ -414,7 +538,8 @@ fn offer_persistence_to(
     delivery: &Mutex<DeliveryMode>,
     persistence_queue_drops: &AtomicU64,
     persistence_outstanding: &AtomicU64,
-    entry: BusEntry,
+    metrics: &LoggingMetrics,
+    entry: PersistenceEntry,
 ) {
     let mut delivery = match delivery.lock() {
         Ok(delivery) => delivery,
@@ -424,37 +549,125 @@ fn offer_persistence_to(
         DeliveryMode::Manual { pending, capacity } => {
             if pending.len() >= *capacity {
                 pending.pop_front();
-                persistence_queue_drops.fetch_add(1, Ordering::Relaxed);
-                decrement_outstanding(persistence_outstanding);
+                record_persistence_queue_drop(persistence_queue_drops, metrics);
+                decrement_outstanding(persistence_outstanding, metrics);
             }
             pending.push_back(entry);
-            persistence_outstanding.fetch_add(1, Ordering::Relaxed);
+            increment_outstanding(persistence_outstanding, metrics);
         }
         DeliveryMode::Worker(tx) => {
-            if tx.try_send(WorkerMessage::PersistBusEntry(entry)).is_ok() {
-                persistence_outstanding.fetch_add(1, Ordering::Relaxed);
+            if tx.try_send(WorkerMessage::Persist(entry)).is_ok() {
+                increment_outstanding(persistence_outstanding, metrics);
             } else {
-                persistence_queue_drops.fetch_add(1, Ordering::Relaxed);
+                record_persistence_queue_drop(persistence_queue_drops, metrics);
             }
         }
         DeliveryMode::ManualPumping(_) | DeliveryMode::Stopping | DeliveryMode::Stopped => {
-            persistence_queue_drops.fetch_add(1, Ordering::Relaxed);
+            record_persistence_queue_drop(persistence_queue_drops, metrics);
         }
     }
 }
 
-fn decrement_outstanding(outstanding: &AtomicU64) {
+fn record_persistence_queue_drop(counter: &AtomicU64, metrics: &LoggingMetrics) {
+    counter.fetch_add(1, Ordering::Relaxed);
+    metrics.record(LoggingMetric::PersistenceQueueDropped { count: 1 });
+}
+
+fn increment_persistence_failure(counter: &AtomicU64, metrics: &LoggingMetrics) {
+    counter.fetch_add(1, Ordering::Relaxed);
+    metrics.record(LoggingMetric::PersistenceFailure { count: 1 });
+}
+
+fn increment_outstanding(outstanding: &AtomicU64, metrics: &LoggingMetrics) {
+    let current = outstanding
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    metrics.record(LoggingMetric::PersistenceOutstanding { current });
+}
+
+fn decrement_outstanding(outstanding: &AtomicU64, metrics: &LoggingMetrics) {
     let _ = outstanding.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
         current.checked_sub(1)
+    });
+    metrics.record(LoggingMetric::PersistenceOutstanding {
+        current: outstanding.load(Ordering::Acquire),
     });
 }
 
 const PERSISTENCE_FAILURE_AUDIT: &str = "logging persistence delivery failed";
+const PROXY_TARGET_CLASSES: &[&str] = &["local", "remote", "external", "none"];
+const PROXY_PROVIDER_LABELS: &[&str] = &[
+    "openai_frontend",
+    "management_api",
+    "local",
+    "remote",
+    "external",
+];
+const PROXY_ENGINE_LABELS: &[&str] = &[
+    "models",
+    "chat_completion",
+    "chat_completion_stream",
+    "completion",
+    "completion_stream",
+    "responses",
+    "responses_stream",
+    "local",
+    "remote",
+    "external",
+];
+const PROXY_ERROR_LABELS: &[&str] = &[
+    "timeout",
+    "unavailable",
+    "connection_failed",
+    "client_disconnected",
+    "cancelled",
+    "rejected",
+    "upstream_status",
+];
+
+pub(super) fn validate_proxy_record(record: &ProxyRecord) -> bool {
+    is_allowed_proxy_label(PROXY_TARGET_CLASSES, &record.target)
+        && record
+            .provider
+            .as_deref()
+            .is_none_or(|value| is_allowed_proxy_label(PROXY_PROVIDER_LABELS, value))
+        && record
+            .engine
+            .as_deref()
+            .is_none_or(|value| is_allowed_proxy_label(PROXY_ENGINE_LABELS, value))
+        && record
+            .error
+            .as_deref()
+            .is_none_or(|value| is_allowed_proxy_label(PROXY_ERROR_LABELS, value))
+}
+
+fn sanitize_proxy_record(mut record: ProxyRecord) -> Option<ProxyRecord> {
+    if !is_allowed_proxy_label(PROXY_TARGET_CLASSES, &record.target) {
+        return None;
+    }
+    record.provider = record
+        .provider
+        .filter(|value| is_allowed_proxy_label(PROXY_PROVIDER_LABELS, value));
+    record.engine = record
+        .engine
+        .filter(|value| is_allowed_proxy_label(PROXY_ENGINE_LABELS, value));
+    record.error = record
+        .error
+        .filter(|value| is_allowed_proxy_label(PROXY_ERROR_LABELS, value));
+    Some(record)
+}
+
+fn is_allowed_proxy_label(allowed: &[&str], value: &str) -> bool {
+    allowed.contains(&value)
+}
 
 /// A fallback audit is itself a canonical System event. Its sink failure is
 /// deliberately terminal for the fallback path; producing another fallback
 /// would create an unbounded self-logging loop.
-fn is_fallback_audit(entry: &BusEntry) -> bool {
+fn is_fallback_audit(entry: &PersistenceEntry) -> bool {
+    let PersistenceEntry::Bus(entry) = entry else {
+        return false;
+    };
     serde_json::from_str::<serde_json::Value>(&entry.payload)
         .ok()
         .and_then(|record| record.get("canonical_envelope").cloned())
@@ -465,7 +678,7 @@ fn is_fallback_audit(entry: &BusEntry) -> bool {
 fn record_persistence_failure(
     writer: &FailOpenWriter,
     event_delivery: &EventDelivery,
-    entry: &BusEntry,
+    entry: &PersistenceEntry,
 ) {
     if is_fallback_audit(entry) {
         writer.record_fallback_suppressed();
@@ -485,6 +698,14 @@ fn record_persistence_failure(
 }
 
 impl LoggingService {
+    /// Return a logging-owned timestamp for bounded persistence metadata.
+    ///
+    /// Request-path callers reach this only through lifecycle owners, so an
+    /// unowned or disabled observer cannot manufacture a durable record.
+    pub(crate) fn proxy_record_timestamp(&self) -> String {
+        self.clock.now()
+    }
+
     /// Create a new logging service with the given sink and clock. In production, `sink` is the real LogStore; in tests, it's a Vec-backed mock.
     pub fn new(config: ServiceConfig, sink: Arc<dyn PersistSink>, clock: Box<dyn Clock>) -> Self {
         let dynamic_limits = LoggingDynamicLimits {
@@ -503,6 +724,7 @@ impl LoggingService {
         dynamic_limits: LoggingDynamicLimits,
     ) -> Self {
         let bus = Arc::new(ReplayBus::new(dynamic_limits.replay_capacity));
+        let metrics = bus.metrics();
         let sequences = SequenceGenerators::new();
         let registry = Arc::new(RequestRegistry::new(config.registry_config.clone()));
         let writer = Arc::new(FailOpenWriter::new());
@@ -517,6 +739,8 @@ impl LoggingService {
             registry: Arc::clone(&registry),
             event_delivery: EventDelivery {
                 bus: Arc::clone(&bus),
+                registry: Arc::clone(&registry),
+                metrics: metrics.clone(),
                 sequences: sequences.clone(),
                 sink_enabled: true,
                 clock: Arc::clone(&clock),
@@ -528,6 +752,7 @@ impl LoggingService {
 
         Self {
             bus,
+            metrics,
             sequences,
             registry,
             writer,
@@ -538,6 +763,7 @@ impl LoggingService {
             manual_abort_handle: Arc::new(Mutex::new(None)),
             delivery,
             spawned: Arc::new(AtomicBool::new(false)),
+            startable: AtomicBool::new(true),
             persistence_queue_drops,
             persistence_failures: Arc::new(AtomicU64::new(0)),
             persistence_outstanding,
@@ -553,6 +779,7 @@ impl LoggingService {
     pub fn new_disabled(config: ServiceConfig) -> Self {
         let replay_capacity = config.queue_capacity;
         let bus = Arc::new(ReplayBus::new(config.queue_capacity));
+        let metrics = bus.metrics();
         let sequences = SequenceGenerators::new();
         let registry = Arc::new(RequestRegistry::new(config.registry_config.clone()));
         let writer = Arc::new(FailOpenWriter::new());
@@ -567,6 +794,8 @@ impl LoggingService {
             registry: Arc::clone(&registry),
             event_delivery: EventDelivery {
                 bus: Arc::clone(&bus),
+                registry: Arc::clone(&registry),
+                metrics: metrics.clone(),
                 sequences: sequences.clone(),
                 sink_enabled: false,
                 clock: Arc::clone(&clock),
@@ -578,6 +807,7 @@ impl LoggingService {
 
         Self {
             bus,
+            metrics,
             sequences,
             registry,
             writer,
@@ -588,6 +818,7 @@ impl LoggingService {
             manual_abort_handle: Arc::new(Mutex::new(None)),
             delivery,
             spawned: Arc::new(AtomicBool::new(false)),
+            startable: AtomicBool::new(true),
             persistence_queue_drops,
             persistence_failures: Arc::new(AtomicU64::new(0)),
             persistence_outstanding,
@@ -609,6 +840,29 @@ impl LoggingService {
         self.dynamic_limits.snapshot()
     }
 
+    /// Attach the optional process-local telemetry adapter. `None` keeps all
+    /// logging metric emissions disabled; attaching the adapter publishes the
+    /// current bounded persistence gauge without replaying historical data.
+    pub(crate) fn set_metrics_sink(&self, sink: Option<Arc<dyn LoggingMetricsSink>>) {
+        self.metrics.set_sink(sink);
+        self.metrics.record(LoggingMetric::PersistenceOutstanding {
+            current: self.persistence_outstanding.load(Ordering::Acquire),
+        });
+    }
+
+    pub(crate) fn metrics(&self) -> LoggingMetrics {
+        self.metrics.clone()
+    }
+
+    pub(crate) fn record_cleanup_outcome(&self, outcome: LoggingCleanupOutcome) {
+        self.metrics.record(LoggingMetric::Cleanup { outcome });
+    }
+
+    pub(crate) fn record_artifact_capture_status(&self, status: LoggingArtifactCaptureStatus) {
+        self.metrics
+            .record(LoggingMetric::ArtifactCapture { status });
+    }
+
     /// Apply both dynamically supported logging limits to this running
     /// service. Shrinking replay capacity evicts only the oldest buffered
     /// entries and accounts for each eviction. This is nonblocking except for
@@ -621,6 +875,15 @@ impl LoggingService {
         });
     }
 
+    #[cfg(test)]
+    pub(crate) fn poison_worker_handle_for_test(&self) {
+        let _worker_handle = match self.worker_handle.lock() {
+            Ok(worker_handle) => worker_handle,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        panic!("poison worker handle lock for recovery coverage");
+    }
+
     /// Start the persistence worker task. Entries accepted before startup are
     /// transferred from the bounded manual delivery queue. Idempotent: calling
     /// twice is a no-op (second call returns false). Returns true for a new
@@ -630,6 +893,9 @@ impl LoggingService {
             .transition_lock
             .lock()
             .expect("transition mutex poisoned");
+        if !self.startable.load(Ordering::Acquire) {
+            return false;
+        }
         // Prevent double-spawn.
         if self
             .spawned
@@ -642,6 +908,7 @@ impl LoggingService {
         let sink_opt = self.sink.clone();
         let persistence_failures = Arc::clone(&self.persistence_failures);
         let persistence_outstanding = Arc::clone(&self.persistence_outstanding);
+        let metrics = self.metrics.clone();
         let writer = Arc::clone(&self.writer);
         let failure_delivery = self.event_delivery();
 
@@ -668,24 +935,24 @@ impl LoggingService {
         };
 
         for entry in pending {
-            if tx.try_send(WorkerMessage::PersistBusEntry(entry)).is_err() {
-                self.persistence_queue_drops.fetch_add(1, Ordering::Relaxed);
-                decrement_outstanding(&self.persistence_outstanding);
+            if tx.try_send(WorkerMessage::Persist(entry)).is_err() {
+                record_persistence_queue_drop(&self.persistence_queue_drops, &self.metrics);
+                decrement_outstanding(&self.persistence_outstanding, &self.metrics);
             }
         }
 
         let task = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 match msg {
-                    WorkerMessage::PersistBusEntry(entry) => {
+                    WorkerMessage::Persist(entry) => {
                         // Parse the bus entry and persist via sink.
                         if let Some(sink) = &sink_opt {
                             // Best-effort: failures are absorbed by fail-open writer.
-                            if Self::process_bus_entry(sink.as_ref(), &entry)
+                            if Self::process_persistence_entry(sink.as_ref(), &entry)
                                 .await
                                 .is_err()
                             {
-                                persistence_failures.fetch_add(1, Ordering::Relaxed);
+                                increment_persistence_failure(&persistence_failures, &metrics);
                                 record_persistence_failure(
                                     writer.as_ref(),
                                     &failure_delivery,
@@ -693,7 +960,7 @@ impl LoggingService {
                                 );
                             }
                         }
-                        decrement_outstanding(&persistence_outstanding);
+                        decrement_outstanding(&persistence_outstanding, &metrics);
                     }
                     WorkerMessage::Shutdown(ack) => {
                         let _ = ack.send(());
@@ -714,6 +981,18 @@ impl LoggingService {
         true
     }
 
+    async fn process_persistence_entry(
+        sink: &dyn PersistSink,
+        entry: &PersistenceEntry,
+    ) -> Result<(), String> {
+        match entry {
+            PersistenceEntry::Bus(entry) => Self::process_bus_entry(sink, entry).await,
+            PersistenceEntry::ProxyRecord(proxy_json) => {
+                sink.persist_proxy_record(proxy_json.clone()).await
+            }
+        }
+    }
+
     async fn process_bus_entry(sink: &dyn PersistSink, entry: &BusEntry) -> Result<(), String> {
         let record: serde_json::Value = serde_json::from_str(&entry.payload)
             .map_err(|e| format!("invalid bus entry JSON: {}", e))?;
@@ -727,6 +1006,20 @@ impl LoggingService {
             )
             .map_err(|error| format!("invalid summary bus record: {error}"))?;
             return sink.persist_summary(summary).await;
+        }
+
+        if record.get("kind").and_then(serde_json::Value::as_str) == Some("audit") {
+            let action = record
+                .get("level")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "audit bus record has no action".to_string())?;
+            let message = record
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "audit bus record has no message".to_string())?;
+            return sink
+                .persist_audit_entry(action.to_owned(), message.to_owned())
+                .await;
         }
 
         if let Some(envelope_value) = record
@@ -772,13 +1065,47 @@ impl LoggingService {
         payload_json: String,
     ) -> Result<(), BusEnqueueError> {
         let event_delivery = self.event_delivery();
-        let _ = enqueue_event_with_delivery(&event_delivery, request_id, channel, payload_json);
+        let _ =
+            enqueue_event_with_delivery(&event_delivery, request_id, channel, payload_json, None);
+        Ok(())
+    }
+
+    /// Enqueue one bounded proxy attempt for durable persistence. It does not
+    /// publish a lifecycle event or transition the parent request, so proxy
+    /// observation cannot acquire duplicate terminal ownership.
+    pub fn enqueue_proxy_record(&self, record: ProxyRecord) -> Result<(), BusEnqueueError> {
+        if self.sink.is_none() {
+            return Ok(());
+        }
+
+        let Some(record) = sanitize_proxy_record(record) else {
+            record_persistence_queue_drop(&self.persistence_queue_drops, &self.metrics);
+            return Ok(());
+        };
+        let proxy_json = match serde_json::to_string(&record) {
+            Ok(proxy_json) => proxy_json,
+            Err(_) => {
+                record_persistence_queue_drop(&self.persistence_queue_drops, &self.metrics);
+                return Ok(());
+            }
+        };
+        {
+            offer_persistence_to(
+                &self.delivery,
+                &self.persistence_queue_drops,
+                &self.persistence_outstanding,
+                &self.metrics,
+                PersistenceEntry::ProxyRecord(proxy_json),
+            );
+        }
         Ok(())
     }
 
     fn event_delivery(&self) -> EventDelivery {
         EventDelivery {
             bus: Arc::clone(&self.bus),
+            registry: Arc::clone(&self.registry),
+            metrics: self.metrics.clone(),
             sequences: self.sequences.clone(),
             sink_enabled: self.sink.is_some(),
             clock: Arc::clone(&self.clock),
@@ -790,6 +1117,15 @@ impl LoggingService {
 
     /// Register a new request in the active registry and emit an admitted event on the Requests channel. Returns a LifecycleGuard for tracking terminal transitions.
     pub fn register_request(&self, request_id: RequestId) -> (LifecycleGuard, EventId) {
+        self.register_request_with_metadata(request_id, RequestSummaryMetadata::default())
+    }
+
+    /// Register a request with metadata available at its trusted ingress boundary.
+    pub(crate) fn register_request_with_metadata(
+        &self,
+        request_id: RequestId,
+        metadata: RequestSummaryMetadata,
+    ) -> (LifecycleGuard, EventId) {
         let guard =
             LifecycleGuard::for_request(request_id, Arc::downgrade(&self.lifecycle_recorder));
 
@@ -799,6 +1135,7 @@ impl LoggingService {
             state: "active".into(),
             created_at: self.clock.now(),
             terminal_at: None,
+            metadata,
         };
         self.registry.register_active(summary.clone());
         if self.sink.is_some() {
@@ -806,6 +1143,7 @@ impl LoggingService {
                 &self.delivery,
                 &self.persistence_queue_drops,
                 &self.persistence_outstanding,
+                &self.metrics,
                 summary,
             );
         }
@@ -823,9 +1161,34 @@ impl LoggingService {
                 method: None,
             })
             .expect("LifecycleEvent serialization is infallible"),
+            None,
         );
 
         (guard, event_id)
+    }
+
+    /// Merge newly available truthful metadata into the request projection.
+    /// Evicted or absent requests simply retain no update.
+    pub(crate) fn merge_request_metadata(
+        &self,
+        request_id: RequestId,
+        metadata: RequestSummaryMetadata,
+    ) {
+        let Some(summary) = self
+            .registry
+            .merge_metadata(&request_id.as_uuid().to_string(), metadata)
+        else {
+            return;
+        };
+        if self.sink.is_some() {
+            offer_summary_persistence(
+                &self.delivery,
+                &self.persistence_queue_drops,
+                &self.persistence_outstanding,
+                &self.metrics,
+                summary,
+            );
+        }
     }
 
     /// Record the beginning of a transport attempt under an existing request.
@@ -911,6 +1274,17 @@ impl LoggingService {
         })
     }
 
+    /// Write one bounded operational audit record through the same replay and
+    /// persistence hand-off as lifecycle records. Both fields are static
+    /// caller-controlled vocabulary, which keeps scheduler health reporting
+    /// path-free and recursion-safe.
+    pub fn write_operational_audit(&self, level: &'static str, message: &'static str) -> bool {
+        let event_delivery = self.event_delivery();
+        self.writer.try_record_error(move || {
+            event_delivery.enqueue_audit(level, message);
+        })
+    }
+
     /// Explicit no-worker pump for deterministic tests. It never drains the
     /// replay bus, and it is a no-op while a worker owns delivery. Returns the
     /// number of entries offered to the sink.
@@ -945,20 +1319,21 @@ impl LoggingService {
             let abort_state = Arc::clone(&self.manual_abort_handle);
             let failures = Arc::clone(&self.persistence_failures);
             let outstanding = Arc::clone(&self.persistence_outstanding);
+            let metrics = self.metrics.clone();
             let writer = Arc::clone(&self.writer);
             let failure_delivery = self.event_delivery();
             let task_completion = Arc::clone(&completion);
             let task = tokio::spawn(async move {
                 let count = entries.len();
                 for entry in entries {
-                    if Self::process_bus_entry(sink.as_ref(), &entry)
+                    if Self::process_persistence_entry(sink.as_ref(), &entry)
                         .await
                         .is_err()
                     {
-                        failures.fetch_add(1, Ordering::Relaxed);
+                        increment_persistence_failure(&failures, &metrics);
                         record_persistence_failure(writer.as_ref(), &failure_delivery, &entry);
                     }
-                    decrement_outstanding(&outstanding);
+                    decrement_outstanding(&outstanding, &metrics);
                 }
                 task_completion.finish();
                 let mut abort = abort_state.lock().expect("manual abort mutex poisoned");
@@ -1020,6 +1395,20 @@ impl LoggingService {
         self.persistence_outstanding.load(Ordering::Relaxed)
     }
 
+    /// Snapshot the delivery owner's state for trusted-local diagnostics.
+    #[allow(dead_code)]
+    pub(crate) fn persistence_worker_state(&self) -> PersistenceWorkerState {
+        let delivery = self.delivery.lock().expect("delivery mutex poisoned");
+        match &*delivery {
+            DeliveryMode::Manual { .. } => PersistenceWorkerState::NotStarted,
+            DeliveryMode::ManualPumping(_) | DeliveryMode::Worker(_) => {
+                PersistenceWorkerState::Running
+            }
+            DeliveryMode::Stopping => PersistenceWorkerState::Stopping,
+            DeliveryMode::Stopped => PersistenceWorkerState::Stopped,
+        }
+    }
+
     /// Get the bus for direct access (tests).
     #[allow(dead_code)]
     pub fn bus_ref(&self) -> Arc<ReplayBus> {
@@ -1050,7 +1439,7 @@ impl LoggingService {
     pub async fn shutdown(&self) -> bool {
         enum ShutdownOwner {
             Worker(WorkerHandle),
-            Manual(VecDeque<BusEntry>),
+            Manual(VecDeque<PersistenceEntry>),
             ManualPump(Arc<ManualPumpCompletion>, AbortHandle),
             Unavailable,
         }
@@ -1123,18 +1512,21 @@ impl LoggingService {
                 Some(sink) => {
                     let result = tokio::time::timeout(self.shutdown_drain_timeout, async {
                         for entry in entries {
-                            if Self::process_bus_entry(sink.as_ref(), &entry)
+                            if Self::process_persistence_entry(sink.as_ref(), &entry)
                                 .await
                                 .is_err()
                             {
-                                self.persistence_failures.fetch_add(1, Ordering::Relaxed);
+                                increment_persistence_failure(
+                                    &self.persistence_failures,
+                                    &self.metrics,
+                                );
                                 record_persistence_failure(
                                     self.writer.as_ref(),
                                     &self.event_delivery(),
                                     &entry,
                                 );
                             }
-                            decrement_outstanding(&self.persistence_outstanding);
+                            decrement_outstanding(&self.persistence_outstanding, &self.metrics);
                         }
                     })
                     .await;
@@ -1160,6 +1552,12 @@ impl LoggingService {
             let lost = self.persistence_outstanding.swap(0, Ordering::AcqRel);
             self.persistence_shutdown_losses
                 .fetch_add(lost, Ordering::Relaxed);
+            if lost != 0 {
+                self.metrics
+                    .record(LoggingMetric::PersistenceShutdownLoss { count: lost });
+            }
+            self.metrics
+                .record(LoggingMetric::PersistenceOutstanding { current: 0 });
         }
         self.set_delivery_stopped();
         true
@@ -1173,6 +1571,20 @@ impl LoggingService {
     fn set_delivery_stopped(&self) {
         let mut delivery = self.delivery.lock().expect("delivery mutex poisoned");
         *delivery = DeliveryMode::Stopped;
+    }
+
+    /// Permanently prevent this concrete service from starting another worker.
+    ///
+    /// The owning [`LoggingRuntimeState`](super::runtime_state::LoggingRuntimeState)
+    /// calls this before it begins asynchronous cleanup. This narrow atomic
+    /// boundary makes an already-captured service handle safe while replacement
+    /// releases global locks and awaits bounded worker shutdown.
+    pub(crate) fn retire(&self) {
+        self.startable.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn is_startable(&self) -> bool {
+        self.startable.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
