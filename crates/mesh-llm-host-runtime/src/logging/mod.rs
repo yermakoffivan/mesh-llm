@@ -15,6 +15,7 @@ mod management_lifecycle;
 mod metrics;
 mod openai_lifecycle;
 mod operator_audit;
+mod output_projection;
 mod persistence;
 pub mod policy;
 mod raw_mesh_lifecycle;

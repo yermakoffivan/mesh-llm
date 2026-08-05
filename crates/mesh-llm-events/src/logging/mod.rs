@@ -8,6 +8,7 @@ pub mod envelope;
 pub mod events;
 pub mod identifiers;
 pub mod lifecycle;
+mod presentation;
 pub mod proxy;
 pub mod replay;
 pub mod summaries;

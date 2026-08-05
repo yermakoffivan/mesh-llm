@@ -8,6 +8,7 @@ use mesh_llm_events::logging::events::LifecycleEvent;
 use mesh_llm_events::logging::identifiers::{AttemptId, EventId, RequestId};
 use mesh_llm_events::logging::proxy::ProxyRecord;
 use mesh_llm_events::logging::replay::ReplayChannel;
+use mesh_llm_events::{OutputEvent, OutputSink, clear_output_sink, set_output_sink};
 
 // Re-import service.rs types. These are private to the logging module but accessible via super.
 #[allow(unused_imports)]
@@ -19,6 +20,40 @@ use std::time::Duration;
 use tokio::sync::{Notify, mpsc};
 
 mod delivery_shutdown;
+
+#[derive(Default)]
+struct RecordingOutputSink {
+    events: std::sync::Mutex<Vec<OutputEvent>>,
+}
+
+impl RecordingOutputSink {
+    fn take_events(&self) -> Vec<OutputEvent> {
+        std::mem::take(
+            &mut *self
+                .events
+                .lock()
+                .expect("recording output sink mutex poisoned"),
+        )
+    }
+}
+
+impl OutputSink for RecordingOutputSink {
+    fn emit_event(&self, event: OutputEvent) -> std::io::Result<()> {
+        self.events
+            .lock()
+            .expect("recording output sink mutex poisoned")
+            .push(event);
+        Ok(())
+    }
+}
+
+struct OutputSinkResetGuard;
+
+impl Drop for OutputSinkResetGuard {
+    fn drop(&mut self) {
+        clear_output_sink();
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Test infrastructure: Vec-backed sink + deterministic clock
@@ -423,6 +458,79 @@ fn canonical_persistence_failure_fallbacks(service: &LoggingService) -> usize {
 // ---------------------------------------------------------------------------
 // Test Scenario 1: One terminal record for each of complete/fail/reject/cancel/drop
 // ---------------------------------------------------------------------------
+
+#[test]
+#[serial_test::serial]
+fn canonical_events_reach_the_output_sink_once_with_safe_local_projection() {
+    let sink = Arc::new(RecordingOutputSink::default());
+    let _reset_guard = OutputSinkResetGuard;
+    set_output_sink(sink.clone());
+
+    let service = make_service();
+    let request_id = RequestId::new();
+    service
+        .enqueue_event(
+            request_id,
+            ReplayChannel::Requests,
+            serde_json::to_string(&LifecycleEvent::Failed {
+                error: "prompt=private Bearer secret-token".to_string(),
+            })
+            .expect("lifecycle event serializes"),
+        )
+        .expect("canonical event enqueue is fail-open");
+
+    let events = sink.take_events();
+    let matching_envelopes = events
+        .iter()
+        .filter_map(|event| match event {
+            OutputEvent::CanonicalLog(envelope) if envelope.request_id == request_id => {
+                Some(envelope.as_ref())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [envelope] = matching_envelopes.as_slice() else {
+        panic!("expected one canonical output event for {request_id:?}, got {events:?}");
+    };
+    assert_eq!(envelope.request_id, request_id);
+    assert!(matches!(envelope.event, LifecycleEvent::Failed { .. }));
+    assert_eq!(envelope.presentation_event_name(), "request_failed");
+    assert_eq!(envelope.presentation_message(), "request failed");
+    let local_summary = envelope.presentation_local_summary();
+    assert!(local_summary.contains(&request_id.as_uuid().to_string()));
+    assert!(local_summary.contains(&envelope.event_id.as_uuid().to_string()));
+    assert!(!local_summary.contains("private"));
+    assert!(!local_summary.contains("secret-token"));
+
+    let (guard, _) = service.register_request(request_id);
+    service
+        .transition_terminal(request_id, &guard, TerminalOutcome::Completed)
+        .expect("first terminal transition succeeds");
+    assert!(
+        service
+            .transition_terminal(
+                request_id,
+                &guard,
+                TerminalOutcome::Failed("ignored".into())
+            )
+            .is_err()
+    );
+
+    let terminal_events = sink.take_events();
+    assert_eq!(
+        terminal_events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                OutputEvent::CanonicalLog(envelope)
+                    if envelope.request_id == request_id
+                        && envelope.presentation_outcome().is_some()
+            ))
+            .count(),
+        1,
+        "terminal lifecycle ownership must still dedupe at the presentation sink"
+    );
+}
 
 #[test]
 fn test_one_terminal_per_outcome() {

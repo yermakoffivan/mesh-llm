@@ -28,6 +28,7 @@ use super::metrics::{
     LoggingArtifactCaptureStatus, LoggingCleanupOutcome, LoggingMetric, LoggingMetrics,
     LoggingMetricsSink, LoggingTerminalOutcome,
 };
+use super::output_projection::emit_accepted_canonical_event;
 use super::registry::RequestSummaryEventSnapshots;
 pub use super::registry::{RegistryConfig, RequestRegistry, RequestSummaryEntry};
 use super::request_metadata::RequestSummaryMetadata;
@@ -572,7 +573,7 @@ fn enqueue_event_with_delivery(
         "occurred_at": occurred_at,
         "payload": payload_json,
     });
-    if let Some(envelope) = canonical_envelope {
+    if let Some(ref envelope) = canonical_envelope {
         let entry_object = entry
             .as_object_mut()
             .expect("logging bus entry is always a JSON object");
@@ -614,6 +615,7 @@ fn enqueue_event_with_delivery(
         entry.channel_hint,
         ReplaySequence::next(channel, sequence),
     );
+    emit_accepted_canonical_event(outcome, canonical_envelope.as_ref());
     if event_delivery.sink_enabled && !matches!(outcome, super::bus::PushOutcome::Rejected) {
         offer_persistence_to(
             &event_delivery.delivery,

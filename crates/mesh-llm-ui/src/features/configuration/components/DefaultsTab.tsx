@@ -24,6 +24,7 @@ import {
 import { ConfigurationDefaultsControl } from '@/features/configuration/components/settings/ConfigurationDefaultsControl'
 import { SettingInfoTrigger } from '@/features/configuration/components/settings/DisabledControlFrame'
 import { SettingResetButton } from '@/features/configuration/components/settings/SettingResetButton'
+import { MetaPill } from '@/features/configuration/components/MetaPill'
 import { validateConfigurationSettingValue } from '@/features/configuration/components/settings/schema-field-validation'
 import { configurationControlDetailBuckets } from '@/features/configuration/components/settings/ConfigurationDefaultsControl'
 import { useDefaultsSettingsState } from '@/features/configuration/hooks/useDefaultsSettingsState'
@@ -52,6 +53,7 @@ import { cn } from '@/lib/cn'
 const categoryIcons: Partial<Record<ConfigurationDefaultsCategoryId, LucideIcon>> = {
   meshllm: Cpu,
   telemetry: Gauge,
+  logging: Gauge,
   'runtime-policy': Cog,
   network: Network,
   attestation: ShieldCheck,
@@ -68,6 +70,7 @@ const categoryIcons: Partial<Record<ConfigurationDefaultsCategoryId, LucideIcon>
 const defaultsCategoryOrder: readonly ConfigurationDefaultsCategoryId[] = [
   'meshllm',
   'telemetry',
+  'logging',
   'runtime-policy',
   'network',
   'attestation',
@@ -199,16 +202,27 @@ function settingDescription(setting: ConfigurationDefaultsSetting) {
   return setting.description
 }
 
+function applyModeLabel(setting: ConfigurationDefaultsSetting) {
+  if (setting.applyMode === 'dynamic_apply' && setting.restartScope === 'none') return 'Applies live'
+  if (setting.restartScope === 'model_reload') return 'Reload required'
+  if (setting.restartScope === 'mesh_restart') return 'Mesh restart required'
+  if (setting.restartScope === 'process_restart' || setting.mutability === 'restart-required') return 'Restart required'
+  if (setting.applyMode === 'dynamic_validation_only') return 'Validated on save'
+  return undefined
+}
+
 function settingLabelAccessory(
   setting: ConfigurationDefaultsSetting,
   visibleDetails: readonly string[],
   disabledDetails: readonly string[],
   resetAction?: ReactNode
 ) {
-  if (visibleDetails.length === 0 && disabledDetails.length === 0 && !resetAction) return undefined
+  const applyLabel = applyModeLabel(setting)
+  if (visibleDetails.length === 0 && disabledDetails.length === 0 && !resetAction && !applyLabel) return undefined
 
   return (
     <div className="flex items-center gap-1.5">
+      {applyLabel ? <MetaPill size="annotation">{applyLabel}</MetaPill> : null}
       {visibleDetails.length > 0 ? (
         <SettingInfoTrigger
           details={visibleDetails}
@@ -252,6 +266,7 @@ function writeShowAdvancedSettings(showAdvanced: boolean) {
 function sectionSubtitle(category: ConfigurationDefaultsCategory) {
   if (category.id === 'meshllm') return 'Local process settings'
   if (category.id === 'telemetry') return 'Opt-in metrics export and queue settings'
+  if (category.id === 'logging') return 'Event history, retention, artifacts, and webhook delivery'
   if (category.id === 'runtime-policy') return 'Runtime reconciliation behavior'
   if (category.id === 'network') return 'Owner-control listener settings'
   if (category.id === 'attestation') return 'Certified-build admission requirements'

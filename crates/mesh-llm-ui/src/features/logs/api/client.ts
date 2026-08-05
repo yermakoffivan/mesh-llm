@@ -1,0 +1,346 @@
+import { env } from '@/lib/env'
+import { LogArtifactId, LogOperationId, LogPageCursor, LogRequestId, LogWebhookDeliveryId } from './ids'
+import {
+  LogsDtoError,
+  parseLogCleanupReceipt,
+  parseLogDeleteReceipt,
+  parseLogExport,
+  parseLogArtifact,
+  parseLogArtifactPage,
+  parseLogLifecycleEventPage,
+  parseLogProxyPage,
+  parseLogRequest,
+  parseLogRequestPage,
+  parseLogWebhookRetryReceipt,
+  type LogArtifact,
+  type LogCleanupReceipt,
+  type LogCleanupOutcome,
+  type LogDeleteReceipt,
+  type LogExport,
+  type LogRequest,
+  type LogWebhookRetryReceipt,
+  type LogsPage
+} from './schemas'
+import { serializeLogsSseSubscription, type LogsSseSubscription } from './sse'
+
+export type LogsCapability<T> = { readonly state: 'supported'; readonly value: T } | { readonly state: 'unsupported' }
+
+export class LogsApiError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string | undefined
+  ) {
+    super(`Logs API request failed with HTTP ${status}`)
+    this.name = 'LogsApiError'
+  }
+}
+
+export type LogsRequestQuery = {
+  readonly cursor?: LogPageCursor
+  readonly limit?: number
+  readonly from?: string
+  readonly to?: string
+  readonly route?: string
+  readonly model?: string
+  readonly provider?: string
+  readonly engine?: string
+  readonly status?: number
+  readonly outcome?: string
+  readonly source?: string
+  readonly sort?: 'asc' | 'desc'
+}
+
+export type LogsPageQuery = {
+  readonly cursor?: LogPageCursor
+  readonly limit?: number
+  readonly sort?: 'asc' | 'desc'
+}
+
+export type LogsProxyQuery = LogsPageQuery & {
+  readonly requestId?: LogRequestId
+  readonly provider?: string
+  readonly engine?: string
+  readonly status?: number
+}
+
+export type LogArtifactDownload = {
+  readonly artifact: Extract<LogArtifact, { readonly contentState: 'available' }>
+  readonly bytes: Uint8Array
+  readonly fileName: string
+  readonly mediaType: string
+}
+
+export type LogArtifactDownloadResult =
+  | { readonly state: 'download'; readonly download: LogArtifactDownload }
+  | { readonly state: 'unavailable'; readonly artifact: LogArtifact }
+
+export type LogExportRequest = {
+  readonly reason: string
+  readonly includeArtifacts: boolean
+}
+
+export type LogCleanupPreviewRequest = {
+  readonly operationId: LogOperationId
+  readonly cutoffBefore: string
+  readonly requestLimit: number
+  readonly source?: 'durable'
+  readonly from?: string
+  readonly to?: string
+  readonly route?: string
+  readonly model?: string
+  readonly provider?: string
+  readonly engine?: string
+  readonly outcome?: LogCleanupOutcome
+  readonly reason: string
+}
+
+export type LogCleanupRunRequest = {
+  readonly operationId: LogOperationId
+  readonly reason: string
+}
+
+export type LogDeleteRequest = {
+  readonly operationId: LogOperationId
+  readonly reason: string
+}
+
+type FetchFunction = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>
+
+function endpoint(path: string) {
+  return `${env.managementApiUrl}${path}`
+}
+
+function setQueryValue(query: URLSearchParams, key: string, value: string | number | undefined) {
+  if (value !== undefined) query.set(key, String(value))
+}
+
+function serializeRequestQuery(input: LogsRequestQuery) {
+  const query = new URLSearchParams()
+  setQueryValue(query, 'cursor', input.cursor?.toString())
+  setQueryValue(query, 'limit', input.limit)
+  setQueryValue(query, 'from', input.from)
+  setQueryValue(query, 'to', input.to)
+  setQueryValue(query, 'route', input.route)
+  setQueryValue(query, 'model', input.model)
+  setQueryValue(query, 'provider', input.provider)
+  setQueryValue(query, 'engine', input.engine)
+  setQueryValue(query, 'status', input.status)
+  setQueryValue(query, 'outcome', input.outcome)
+  setQueryValue(query, 'source', input.source)
+  setQueryValue(query, 'sort', input.sort)
+  return query.toString()
+}
+
+function serializePageQuery(input: LogsPageQuery) {
+  const query = new URLSearchParams()
+  setQueryValue(query, 'cursor', input.cursor?.toString())
+  setQueryValue(query, 'limit', input.limit)
+  setQueryValue(query, 'sort', input.sort)
+  return query.toString()
+}
+
+function appendQuery(path: string, query: string) {
+  return query.length === 0 ? path : `${path}?${query}`
+}
+
+async function responseJson(response: Response): Promise<unknown> {
+  let text: string
+  try {
+    text = await response.text()
+  } catch {
+    throw new LogsDtoError()
+  }
+  try {
+    return JSON.parse(text)
+  } catch {
+    throw new LogsDtoError()
+  }
+}
+
+function errorCode(body: unknown) {
+  if (!isRecord(body)) return undefined
+  const error = body['error']
+  if (!isRecord(error)) return undefined
+  const code = error['code']
+  return typeof code === 'string' ? code : undefined
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object'
+}
+
+async function responseError(response: Response) {
+  let body: unknown
+  try {
+    body = await responseJson(response)
+  } catch {
+    body = undefined
+  }
+  return new LogsApiError(response.status, errorCode(body))
+}
+
+function isUnsupportedResponse(response: Response, error: LogsApiError) {
+  return response.status === 404 || error.code === 'unsupported' || error.code === 'not_implemented'
+}
+
+function decodeBase64(value: string) {
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+    throw new LogsDtoError()
+  }
+  let decoded: string
+  try {
+    decoded = atob(value)
+  } catch {
+    throw new LogsDtoError()
+  }
+  return Uint8Array.from(decoded, (character) => character.charCodeAt(0))
+}
+
+function safeMediaType(mediaKind: string | undefined) {
+  return mediaKind && /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i.test(mediaKind)
+    ? mediaKind
+    : 'application/octet-stream'
+}
+
+export class LogsApiClient {
+  readonly #fetch: FetchFunction
+
+  constructor(fetchFunction?: FetchFunction) {
+    this.#fetch = fetchFunction ?? fetch.bind(globalThis)
+  }
+
+  async listRequests(query: LogsRequestQuery = {}): Promise<LogsCapability<LogsPage<LogRequest>>> {
+    const response = await this.#fetch(endpoint(appendQuery('/api/logs/requests', serializeRequestQuery(query))))
+    if (!response.ok) {
+      const error = await responseError(response)
+      if (isUnsupportedResponse(response, error)) return { state: 'unsupported' }
+      throw error
+    }
+    return { state: 'supported', value: parseLogRequestPage(await responseJson(response)) }
+  }
+
+  async getRequest(requestId: LogRequestId) {
+    return this.getJson(`/api/logs/requests/${encodeURIComponent(requestId.toString())}`, parseLogRequest)
+  }
+
+  async listRequestEvents(requestId: LogRequestId, query: LogsPageQuery = {}) {
+    return this.getJson(
+      appendQuery(`/api/logs/requests/${encodeURIComponent(requestId.toString())}/events`, serializePageQuery(query)),
+      parseLogLifecycleEventPage
+    )
+  }
+
+  async listRequestArtifacts(requestId: LogRequestId, query: LogsPageQuery = {}) {
+    return this.getJson(
+      appendQuery(
+        `/api/logs/requests/${encodeURIComponent(requestId.toString())}/artifacts`,
+        serializePageQuery(query)
+      ),
+      parseLogArtifactPage
+    )
+  }
+
+  async getArtifact(artifactId: LogArtifactId) {
+    return this.getJson(`/api/logs/artifacts/${encodeURIComponent(artifactId.toString())}`, parseLogArtifact)
+  }
+
+  async listProxy(query: LogsProxyQuery = {}) {
+    const params = new URLSearchParams(serializePageQuery(query))
+    setQueryValue(params, 'request_id', query.requestId?.toString())
+    setQueryValue(params, 'provider', query.provider)
+    setQueryValue(params, 'engine', query.engine)
+    setQueryValue(params, 'status', query.status)
+    return this.getJson(appendQuery('/api/logs/proxy', params.toString()), parseLogProxyPage)
+  }
+
+  logsEventSourceUrl(subscription: LogsSseSubscription) {
+    return endpoint(appendQuery('/api/logs/events', serializeLogsSseSubscription(subscription)))
+  }
+
+  async downloadArtifact(artifactId: LogArtifactId): Promise<LogArtifactDownloadResult> {
+    const artifact = await this.getArtifact(artifactId)
+    if (artifact.contentState !== 'available' || artifact.contentBase64 === undefined) {
+      return { state: 'unavailable', artifact }
+    }
+    return {
+      state: 'download',
+      download: {
+        artifact,
+        bytes: decodeBase64(artifact.contentBase64),
+        fileName: `mesh-llm-log-${artifact.artifactId.toString()}.bin`,
+        mediaType: safeMediaType(artifact.mediaKind)
+      }
+    }
+  }
+
+  async exportRequests(query: LogsRequestQuery, request: LogExportRequest): Promise<LogExport> {
+    const result = await this.postJson(
+      appendQuery('/api/logs/requests/export', serializeRequestQuery(query)),
+      { reason: request.reason, includeArtifacts: request.includeArtifacts },
+      parseLogExport
+    )
+    if (!request.includeArtifacts && result.artifactContentIncluded) throw new LogsDtoError()
+    return result
+  }
+
+  async previewCleanup(request: LogCleanupPreviewRequest): Promise<LogCleanupReceipt> {
+    return this.postJson(
+      '/api/logs/cleanup/preview',
+      {
+        operationId: request.operationId.toString(),
+        cutoffBefore: request.cutoffBefore,
+        requestLimit: request.requestLimit,
+        source: request.source,
+        from: request.from,
+        to: request.to,
+        route: request.route,
+        model: request.model,
+        provider: request.provider,
+        engine: request.engine,
+        outcome: request.outcome,
+        reason: request.reason
+      },
+      parseLogCleanupReceipt
+    )
+  }
+
+  async runCleanup(request: LogCleanupRunRequest): Promise<LogCleanupReceipt> {
+    return this.postJson(
+      '/api/logs/cleanup/run',
+      { operationId: request.operationId.toString(), reason: request.reason },
+      parseLogCleanupReceipt
+    )
+  }
+
+  async deleteRequest(requestId: LogRequestId, request: LogDeleteRequest): Promise<LogDeleteReceipt> {
+    return this.postJson(
+      `/api/logs/requests/${encodeURIComponent(requestId.toString())}/delete`,
+      { operationId: request.operationId.toString(), reason: request.reason },
+      parseLogDeleteReceipt
+    )
+  }
+
+  async retryWebhookDelivery(deliveryId: LogWebhookDeliveryId, reason: string): Promise<LogWebhookRetryReceipt> {
+    return this.postJson(
+      `/api/logs/webhooks/${encodeURIComponent(deliveryId.toString())}/retry`,
+      { reason },
+      parseLogWebhookRetryReceipt
+    )
+  }
+
+  private async getJson<T>(path: string, parser: (input: unknown) => T): Promise<T> {
+    const response = await this.#fetch(endpoint(path))
+    if (!response.ok) throw await responseError(response)
+    return parser(await responseJson(response))
+  }
+
+  private async postJson<T>(path: string, body: unknown, parser: (input: unknown) => T): Promise<T> {
+    const response = await this.#fetch(endpoint(path), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    })
+    if (!response.ok) throw await responseError(response)
+    return parser(await responseJson(response))
+  }
+}

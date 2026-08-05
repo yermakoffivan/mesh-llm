@@ -12,6 +12,8 @@ import {
   mergeConfigurationIntoMeshConfig,
   mergeConfigurationDefaultsIntoMeshConfig,
   runtimeControlApplyErrorMessage,
+  type RuntimeConfigControlStatePayload,
+  type RuntimeControlDiagnostic,
   type RuntimeConfigSchemaEntry,
   type RuntimeConfigSchemaReference,
   type RuntimeControlMeshConfig
@@ -433,6 +435,25 @@ function schemaSetting(
       renderer_id: rendererId,
       control_hint: 'text'
     }
+  }
+}
+
+function loggingSchemaSetting(
+  canonicalPath: string,
+  valueSchema: RuntimeConfigSchemaEntry['value_schema'],
+  overrides: Partial<RuntimeConfigSchemaEntry> = {}
+): RuntimeConfigSchemaEntry {
+  return {
+    canonical_path: canonicalPath,
+    owner: 'built_in',
+    source: { kind: 'built_in' },
+    value_schema: valueSchema,
+    support: 'supported',
+    control_surfaces: ['config_file'],
+    apply_mode: 'static_on_load',
+    restart_scope: 'process_restart',
+    visibility: 'advanced',
+    ...overrides
   }
 }
 
@@ -1231,6 +1252,200 @@ describe('adaptStatusToConfiguration', () => {
       debug: true,
       listen_all: true
     })
+  })
+
+  it('projects logging settings from the live schema with server-owned controls and apply metadata', () => {
+    const schema: RuntimeConfigSchemaReference = {
+      settings: [
+        loggingSchemaSetting(
+          'logging.retention_ttl_secs',
+          { kind: 'integer' },
+          {
+            apply_mode: 'dynamic_apply',
+            restart_scope: 'none',
+            constraints: [{ kind: 'range', min: '60', max: '604800' }],
+            presentation: {
+              label: 'Retention period',
+              help: 'Server-provided retention copy.',
+              category_id: 'logging',
+              category_label: 'Event history',
+              category_summary: 'Server-provided logging category.',
+              category_order: 35,
+              setting_order: 10,
+              unit: 'seconds'
+            }
+          }
+        ),
+        loggingSchemaSetting(
+          'logging.replay_capacity',
+          { kind: 'integer' },
+          {
+            apply_mode: 'dynamic_apply',
+            restart_scope: 'none',
+            constraints: [{ kind: 'range', min: '1', max: '5000' }],
+            presentation: {
+              label: 'Replay buffer capacity',
+              help: 'Server-provided replay copy.',
+              category_id: 'logging',
+              setting_order: 20
+            }
+          }
+        ),
+        loggingSchemaSetting(
+          'logging.artifact.capture_mode',
+          {
+            kind: 'enum',
+            values: ['metadata_only', 'redacted_artifacts']
+          },
+          {
+            presentation: {
+              label: 'Artifact retention mode',
+              help: 'Server-provided artifact mode copy.',
+              category_id: 'logging',
+              setting_order: 30
+            }
+          }
+        ),
+        loggingSchemaSetting(
+          'logging.artifact.byte_limit_bytes',
+          { kind: 'integer' },
+          {
+            constraints: [{ kind: 'range', min: '1024', max: '1048576' }],
+            presentation: {
+              label: 'Per-artifact byte cap',
+              help: 'Server-provided artifact cap copy.',
+              category_id: 'logging',
+              setting_order: 40
+            }
+          }
+        ),
+        loggingSchemaSetting('logging.legacy_payload_access', { kind: 'string' }, { support: 'unsupported' })
+      ]
+    }
+    const controlState = {
+      settings: {
+        'logging.artifact.byte_limit_bytes': {
+          enabled: false,
+          reason: 'Artifact capture is unavailable while capture mode is metadata_only.',
+          source: 'runtime',
+          write_policy: 'reject_when_disabled'
+        }
+      }
+    } satisfies RuntimeConfigControlStatePayload
+
+    const settings = createConfigurationMeshLLMSettingsFromSchema(schema, controlState)
+    const retention = settings.settings.find((setting) => setting.id === 'logging.retention_ttl_secs')
+    const replay = settings.settings.find((setting) => setting.id === 'logging.replay_capacity')
+    const artifactLimit = settings.settings.find((setting) => setting.id === 'logging.artifact.byte_limit_bytes')
+
+    expect(settings.categories).toEqual([expect.objectContaining({ id: 'logging', label: 'Event history', order: 35 })])
+    expect(settings.settings.map((setting) => setting.id).sort()).toEqual([
+      'logging.artifact.byte_limit_bytes',
+      'logging.artifact.capture_mode',
+      'logging.replay_capacity',
+      'logging.retention_ttl_secs'
+    ])
+    expect(retention).toMatchObject({
+      label: 'Retention period',
+      description: 'Server-provided retention copy.',
+      validationConstraints: [{ kind: 'range', min: '60', max: '604800' }],
+      control: { kind: 'range', min: 60, max: 604800, step: 1, unit: 'seconds' },
+      mutability: 'runtime',
+      applyMode: 'dynamic_apply',
+      restartScope: 'none'
+    })
+    expect(replay).toMatchObject({
+      label: 'Replay buffer capacity',
+      description: 'Server-provided replay copy.',
+      mutability: 'runtime',
+      applyMode: 'dynamic_apply',
+      restartScope: 'none'
+    })
+    expect(artifactLimit).toMatchObject({
+      label: 'Per-artifact byte cap',
+      description: 'Server-provided artifact cap copy.',
+      mutability: 'restart-required',
+      applyMode: 'static_on_load',
+      restartScope: 'process_restart',
+      controlState: controlState.settings['logging.artifact.byte_limit_bytes']
+    })
+    expect(settings.settings.find((setting) => setting.id === 'logging.legacy_payload_access')).toBeUndefined()
+
+    expect(
+      createConfigurationDefaultsValuesFromMeshConfig(
+        { logging: { retention_ttl_secs: 120, replay_capacity: 25 } },
+        schema,
+        controlState
+      )
+    ).toMatchObject({
+      'logging.retention_ttl_secs': '120',
+      'logging.replay_capacity': '25'
+    })
+  })
+
+  it('keeps metadata-only artifact controls from authorizing payload-related writes', () => {
+    const schema: RuntimeConfigSchemaReference = {
+      settings: [
+        loggingSchemaSetting('logging.artifact.capture_mode', {
+          kind: 'enum',
+          values: ['metadata_only', 'redacted_artifacts']
+        }),
+        loggingSchemaSetting('logging.artifact.byte_limit_bytes', { kind: 'integer' })
+      ]
+    }
+    const controlState = {
+      settings: {
+        'logging.artifact.byte_limit_bytes': {
+          enabled: false,
+          reason: 'Artifact capture is unavailable while capture mode is metadata_only.',
+          source: 'runtime',
+          write_policy: 'reject_when_disabled'
+        }
+      }
+    } satisfies RuntimeConfigControlStatePayload
+
+    expect(() =>
+      mergeConfigurationIntoMeshConfig(
+        { logging: { artifact: { capture_mode: 'metadata_only' } } },
+        {
+          values: {
+            'logging.artifact.byte_limit_bytes': '4096',
+            'logging.artifact.payload': 'not-a-schema-setting'
+          },
+          nodes: [],
+          assigns: [],
+          catalog: []
+        },
+        schema,
+        { controlState }
+      )
+    ).toThrow(/logging\.artifact\.byte_limit_bytes/)
+  })
+
+  it('formats invalid and unsupported logging diagnostics without losing typed fields', () => {
+    const diagnostics = [
+      {
+        code: 'invalid_value',
+        severity: 'error',
+        source: 'config',
+        schema_source: 'built_in',
+        canonical_path: 'logging.retention_ttl_secs',
+        message: 'Retention must be at least 60 seconds.',
+        help: 'Increase logging.retention_ttl_secs.'
+      },
+      {
+        code: 'unsupported_setting',
+        severity: 'warning',
+        source: 'config',
+        schema_source: 'built_in',
+        canonical_path: 'logging.legacy_payload_access',
+        message: 'This logging setting is unsupported.'
+      }
+    ] satisfies readonly RuntimeControlDiagnostic[]
+
+    expect(formatConfigDiagnostics(diagnostics)).toContain('logging.retention_ttl_secs')
+    expect(formatConfigDiagnostics(diagnostics)).toContain('unsupported')
+    expect(diagnostics[1]?.schema_source).toBe('built_in')
   })
 
   it('places gpu assignment controls on the models tab instead of meshllm', () => {

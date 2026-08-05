@@ -3,6 +3,8 @@ import { AppErrorBoundary, NotFoundRoute } from '@/app/error-boundaries/AppError
 import { FeatureErrorBoundary } from '@/app/error-boundaries/FeatureErrorBoundary'
 import { RootLayout } from '@/app/layout/RootLayout'
 import { parseDeveloperPlaygroundSearch } from '@/features/developer/playground/developer-playground-tabs'
+import { parseLogsLedgerSearch } from '@/features/logs/lib/log-search'
+import { parseLogRequestDetailsSearch } from '@/features/logs/lib/log-request-details'
 import { env } from '@/lib/env'
 
 const enableMeshVizPerfRoute = env.isDevelopment || import.meta.env.VITE_ENABLE_PERF_ROUTE === 'true'
@@ -24,6 +26,22 @@ const reservesRoute = createRoute({
   path: '/reserves',
   head: () => ({ meta: [{ title: 'MeshLLM - Reserves' }] }),
   component: lazyRouteComponent(() => import('@/features/reserves/pages/ReservesPage'), 'ReservesPageContent'),
+  errorComponent: FeatureErrorBoundary
+})
+const logsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/logs',
+  head: () => ({ meta: [{ title: 'MeshLLM - Logs' }] }),
+  validateSearch: parseLogsLedgerSearch,
+  component: lazyRouteComponent(() => import('@/features/logs/pages/LogsLedgerPage'), 'LogsLedgerPage'),
+  errorComponent: FeatureErrorBoundary
+})
+const logRequestDetailsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/logs/$requestId',
+  head: () => ({ meta: [{ title: 'MeshLLM - Request details' }] }),
+  validateSearch: parseLogRequestDetailsSearch,
+  component: lazyRouteComponent(() => import('@/features/logs/pages/LogRequestDetailsPage'), 'LogRequestDetailsPage'),
   errorComponent: FeatureErrorBoundary
 })
 const chatRoute = createRoute({
@@ -80,6 +98,8 @@ const meshVizPerfRoute = createRoute({
 export const routeTree = rootRoute.addChildren([
   indexRoute,
   reservesRoute,
+  logsRoute,
+  logRequestDetailsRoute,
   chatRoute,
   configurationRoute,
   configurationTabRoute,

@@ -19,6 +19,8 @@ import { DeveloperPlaygroundPage } from '@/features/developer/pages/DeveloperPla
 import { DashboardPageSurface } from '@/features/network/pages/DashboardPage'
 import { parseDeveloperPlaygroundSearch } from '@/features/developer/playground/developer-playground-tabs'
 import { ReservesPageContent } from '@/features/reserves/pages/ReservesPage'
+import { parseLogsLedgerSearch } from '@/features/logs/lib/log-search'
+import { parseLogRequestDetailsSearch } from '@/features/logs/lib/log-request-details'
 import { PluginWebUiRoutePage } from '@/features/plugins/web-ui/PluginWebUiRoutePage'
 import { pluginKeys, statusKeys } from '@/lib/query/query-keys'
 import type { PluginWebUiStateRaw } from '@/lib/api/plugin-types'
@@ -49,6 +51,14 @@ vi.mock('@/features/plugins/web-ui/bundle-loader', () => ({
 
 vi.mock('@/features/reserves/pages/ReservesPage', () => ({
   ReservesPageContent: () => <div>Reserves route</div>
+}))
+
+vi.mock('@/features/logs/pages/LogsLedgerPage', () => ({
+  LogsLedgerPage: () => <div>Logs route</div>
+}))
+
+vi.mock('@/features/logs/pages/LogRequestDetailsPage', () => ({
+  LogRequestDetailsPage: () => <div>Request details route</div>
 }))
 
 vi.mock('@/features/developer/pages/DeveloperPlaygroundPage', async () => {
@@ -129,6 +139,20 @@ const reservesRoute = createRoute({
   head: () => ({ meta: [{ title: 'MeshLLM - Reserves' }] }),
   component: ReservesPageContent
 })
+const logsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/logs',
+  head: () => ({ meta: [{ title: 'MeshLLM - Logs' }] }),
+  validateSearch: parseLogsLedgerSearch,
+  component: () => <div>Logs route</div>
+})
+const logRequestDetailsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/logs/$requestId',
+  head: () => ({ meta: [{ title: 'MeshLLM - Request details' }] }),
+  validateSearch: parseLogRequestDetailsSearch,
+  component: () => <div>Request details route</div>
+})
 const configurationRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/configuration',
@@ -157,6 +181,8 @@ const pluginWebUiRoute = createRoute({
 const testRouteTree = rootRoute.addChildren([
   indexRoute,
   reservesRoute,
+  logsRoute,
+  logRequestDetailsRoute,
   chatRoute,
   configurationRoute,
   configurationTabRoute,
@@ -196,6 +222,12 @@ describe('app router routes', () => {
   it.each([
     ['/', 'MeshLLM - Dashboard', 'Dashboard route'],
     ['/reserves', 'MeshLLM - Reserves', 'Reserves route'],
+    ['/logs?provider=reserve-a&outcome=failed', 'MeshLLM - Logs', 'Logs route'],
+    [
+      '/logs/00000000-0000-4000-8000-000000000001?provider=reserve-a&tab=routing',
+      'MeshLLM - Request details',
+      'Request details route'
+    ],
     ['/chat', 'MeshLLM - Chat', 'Chat route cache: missing'],
     ['/configuration/defaults', 'MeshLLM - Configuration', 'Active route tab: general'],
     ['/__playground?tab=shell-controls', 'MeshLLM - Developer Playground', 'Active developer route tab: shell-controls']
@@ -204,6 +236,33 @@ describe('app router routes', () => {
 
     await screen.findByText(routeText)
     await waitFor(() => expect(document.title).toBe(title))
+  })
+
+  it('restores a filtered logs deep link through the route search parser', async () => {
+    const testRouter = renderRouterAt('/logs?provider=reserve-a&outcome=failed&cursor=next-page&trail=previous-page')
+
+    await screen.findByText('Logs route')
+    expect(testRouter.state.location.pathname).toBe('/logs')
+    expect(testRouter.state.location.search).toMatchObject({
+      provider: 'reserve-a',
+      outcome: 'failed',
+      cursor: 'next-page',
+      trail: ['previous-page']
+    })
+  })
+
+  it('preserves ledger pagination context for a request details deep link', async () => {
+    const testRouter = renderRouterAt(
+      '/logs/00000000-0000-4000-8000-000000000001?provider=reserve-a&cursor=next-page&trail=previous-page&tab=stream'
+    )
+
+    await screen.findByText('Request details route')
+    expect(testRouter.state.location.search).toMatchObject({
+      provider: 'reserve-a',
+      cursor: 'next-page',
+      trail: ['previous-page'],
+      tab: 'stream'
+    })
   })
 
   it('canonicalizes the bare configuration route to the default tab path', async () => {

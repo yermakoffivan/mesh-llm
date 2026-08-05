@@ -584,6 +584,8 @@ pub enum OutputEvent {
         category: &'static str,
         params: Vec<(String, Value)>,
     },
+    /// A privacy-safe presentation of a canonical logging lifecycle event.
+    CanonicalLog(Box<logging::envelope::CanonicalEnvelope>),
 }
 
 impl OutputEvent {
@@ -630,6 +632,7 @@ impl OutputEvent {
             OutputEvent::ShutdownRequested { signal } => signal,
             OutputEvent::Shutdown { .. } => "shutdown",
             OutputEvent::LlamaNativeLog { category, .. } => category,
+            OutputEvent::CanonicalLog(envelope) => envelope.presentation_event_name(),
         }
     }
 
@@ -640,6 +643,7 @@ impl OutputEvent {
                 OutputLevel::Error
             }
             OutputEvent::LlamaNativeLog { .. } => OutputLevel::Debug,
+            OutputEvent::CanonicalLog(envelope) => envelope.presentation_level(),
             OutputEvent::Warning { .. } => OutputLevel::Warn,
             OutputEvent::Error { .. } => OutputLevel::Error,
             OutputEvent::Fatal { .. } => OutputLevel::Fatal,
@@ -807,6 +811,16 @@ impl OutputEvent {
                 .clone()
                 .unwrap_or_else(|| "mesh-llm shutting down".to_string()),
             OutputEvent::LlamaNativeLog { message, .. } => message.clone(),
+            OutputEvent::CanonicalLog(envelope) => envelope.presentation_message(),
+        }
+    }
+
+    /// Timestamp supplied by canonical lifecycle events. Other events are
+    /// timestamped when the output formatter renders them.
+    pub fn occurred_at(&self) -> Option<&str> {
+        match self {
+            OutputEvent::CanonicalLog(envelope) => Some(&envelope.occurred_at),
+            _ => None,
         }
     }
 }

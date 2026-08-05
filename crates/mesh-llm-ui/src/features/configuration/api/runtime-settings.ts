@@ -193,6 +193,8 @@ function schemaSettingFromEntry(
     controlState: entryControlState,
     visibility: entry.visibility === 'advanced' ? 'advanced' : 'standard',
     mutability: schemaMutability(entry),
+    applyMode: entry.apply_mode,
+    restartScope: entry.restart_scope,
     validationConstraints: entry.constraints,
     categoryOrder: category.order ?? DEFAULT_CATEGORY_ORDER
   }

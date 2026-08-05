@@ -107,6 +107,16 @@ describe('RootLayout', () => {
     expect(useStatusStreamSpy).toHaveBeenCalledWith({ enabled: true })
   })
 
+  it('selects the Logs tab for the logs route', () => {
+    routerState.pathname = '/logs'
+
+    renderRootLayout('harness')
+
+    expect(topNavSpy.mock.calls.at(-1)?.[0]).toEqual(
+      expect.objectContaining({ tab: 'logs', tabHrefs: expect.objectContaining({ logs: '/logs' }) })
+    )
+  })
+
   it('passes privacy-safe private-mesh invitation rows while keeping the configured API target', () => {
     useStatusQuerySpy.mockReturnValue({
       data: {

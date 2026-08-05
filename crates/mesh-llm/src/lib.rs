@@ -135,6 +135,7 @@ fn print_advanced_help() {
         command = command.mut_subcommand(name, |subcommand| subcommand.hide(false));
     }
     command.print_help().ok();
+    print!("{}", mesh_llm_cli::parser::logging_help());
     eprintln!();
 }
 

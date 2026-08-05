@@ -111,6 +111,7 @@ fn native_model_open_handled_failure_translates_to_warning_without_readiness_eve
 }
 
 #[test]
+#[serial_test::serial]
 fn native_model_open_reporter_emits_visibility_only_events() {
     let sink = Arc::new(RecordingOutputSink::default());
     let _reset_guard = OutputSinkResetGuard;

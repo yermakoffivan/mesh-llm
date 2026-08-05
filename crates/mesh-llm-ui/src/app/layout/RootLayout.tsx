@@ -29,15 +29,17 @@ import type { ShellHarnessData, AppTab } from '@/features/app-tabs/types'
 function pathToTab(pathname: string): AppTab | null {
   if (pathname.startsWith('/chat')) return 'chat'
   if (pathname.startsWith('/reserves')) return 'reserves'
+  if (pathname.startsWith('/logs')) return 'logs'
   if (pathname.startsWith('/configuration')) return 'configuration'
   if (pathname.startsWith('/plugins/')) return null
   if (env.isDevelopment && pathname.startsWith('/__playground')) return null
   return 'network'
 }
 
-function tabToPath(tab: Exclude<AppTab, 'configuration'>): '/' | '/chat' | '/reserves' {
+function tabToPath(tab: Exclude<AppTab, 'configuration'>): '/' | '/chat' | '/reserves' | '/logs' {
   if (tab === 'chat') return '/chat'
   if (tab === 'reserves') return '/reserves'
+  if (tab === 'logs') return '/logs'
   return '/'
 }
 
@@ -97,6 +99,7 @@ export function RootLayout({ data = SHELL_HARNESS }: RootLayoutProps = {}) {
     () => ({
       network: hrefWithBasePath('/'),
       reserves: hrefWithBasePath('/reserves'),
+      logs: hrefWithBasePath('/logs'),
       chat: hrefWithBasePath('/chat'),
       configuration: hrefWithBasePath(
         `/configuration/${pathToConfigurationTab(pathname, enabledConfigurationTabs) ?? 'general'}`

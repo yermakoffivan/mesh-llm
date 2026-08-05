@@ -329,6 +329,14 @@ const DEFAULTS_CATEGORY_FALLBACKS: Record<string, ConfigurationDefaultsCategory>
     tomlSection: 'telemetry',
     order: 20
   },
+  logging: {
+    id: 'logging',
+    label: 'Logging',
+    summary: 'Event history, retention, artifact capture, and webhook settings',
+    help: 'Logging settings written to the local config file',
+    tomlSection: 'logging',
+    order: 30
+  },
   'runtime-policy': {
     id: 'runtime-policy',
     label: 'Runtime Policy',
@@ -445,6 +453,7 @@ function configSectionForPath(canonicalPath: string) {
 function categoryForDefaultsPath(canonicalPath: string) {
   if (canonicalPath.startsWith('gpu.')) return 'runtime'
   if (canonicalPath.startsWith('telemetry.')) return 'telemetry'
+  if (canonicalPath.startsWith('logging.')) return 'logging'
   if (canonicalPath === 'runtime.debug') return 'meshllm'
   if (canonicalPath === 'runtime.listen_all') return 'network'
   if (canonicalPath.startsWith('runtime.')) return 'runtime-policy'
@@ -593,9 +602,21 @@ function categoryFromEntry(
     label: entry.presentation?.category_label ?? fallback.label,
     summary: entry.presentation?.category_summary ?? fallback.summary,
     help: entry.presentation?.category_summary ?? fallback.help,
-    tomlSection: context === 'settings' ? configSectionForPath(entry.canonical_path) : fallback.tomlSection,
+    tomlSection:
+      context === 'settings'
+        ? entry.canonical_path.startsWith('logging.')
+          ? 'logging'
+          : configSectionForPath(entry.canonical_path)
+        : fallback.tomlSection,
     order: entry.presentation?.category_order ?? fallback.order ?? DEFAULT_CATEGORY_ORDER
   }
+}
+
+function hasCategoryPresentation(entry: RuntimeConfigSchemaEntry) {
+  const presentation = entry.presentation
+  return Boolean(
+    presentation?.category_label || presentation?.category_summary || presentation?.category_order !== undefined
+  )
 }
 
 function schemaSettingFromEntry(input: SchemaSettingFromEntryInput): ConfigurationDefaultsSetting {
@@ -636,6 +657,8 @@ function schemaSettingFromEntry(input: SchemaSettingFromEntryInput): Configurati
     controlState,
     visibility: entry.visibility === 'advanced' ? 'advanced' : 'standard',
     mutability: schemaMutability(entry),
+    applyMode: entry.apply_mode,
+    restartScope: entry.restart_scope,
     validationConstraints: entry.constraints,
     categoryOrder: category.order ?? DEFAULT_CATEGORY_ORDER
   }
@@ -676,7 +699,8 @@ function createConfigurationSettingsFromSchema(
   for (const entry of schema?.settings ?? []) {
     if (!isEditableSchemaEntry(entry) || !includeEntry(entry)) continue
     const category = categoryFromEntry(entry, 'settings')
-    categoryById.set(String(category.id), category)
+    const categoryId = String(category.id)
+    if (!categoryById.has(categoryId) || hasCategoryPresentation(entry)) categoryById.set(categoryId, category)
   }
 
   return {
@@ -695,7 +719,10 @@ export function createConfigurationMeshLLMSettingsFromSchema(
 ): ConfigurationSettingsHarnessData {
   return createConfigurationSettingsFromSchema(
     schema,
-    (entry) => entry.canonical_path.startsWith('telemetry.') || entry.canonical_path === 'runtime.debug',
+    (entry) =>
+      entry.canonical_path.startsWith('telemetry.') ||
+      entry.canonical_path.startsWith('logging.') ||
+      entry.canonical_path === 'runtime.debug',
     'Generated General settings',
     controlState
   )
