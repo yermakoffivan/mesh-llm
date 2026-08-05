@@ -150,7 +150,7 @@ pub(super) fn json_formatter_emits_llama_server_starting_payload() {
 }
 
 #[test]
-pub(super) fn json_formatter_includes_invite_mesh_metadata() {
+pub(super) fn json_formatter_redacts_invite_token_and_keeps_mesh_metadata() {
     let mut formatter = JsonFormatter;
     let rendered = formatter
         .format(&OutputEvent::InviteToken {
@@ -162,8 +162,26 @@ pub(super) fn json_formatter_includes_invite_mesh_metadata() {
     let value: Value = serde_json::from_str(rendered.trim_end()).expect("line should parse");
 
     assert_eq!(value["event"], "invite_token");
-    assert_eq!(value["token"], "invite-token");
     assert_eq!(value["mesh_id"], "mesh-123");
+    assert_eq!(value["token_withheld"], true);
+    assert!(value.get("token").is_none());
+    assert!(!rendered.contains("invite-token"));
+}
+
+#[test]
+pub(super) fn pretty_formatter_redacts_invite_token_and_keeps_mesh_metadata() {
+    let mut formatter = PrettyFormatter;
+    let rendered = formatter
+        .format(&OutputEvent::InviteToken {
+            token: "invite-token".to_string(),
+            mesh_id: "mesh-123".to_string(),
+            mesh_name: Some("private-mesh".to_string()),
+        })
+        .expect("invite render should succeed");
+
+    assert!(rendered.contains("Invite created for mesh private-mesh (mesh-123)"));
+    assert!(rendered.contains("token withheld for privacy"));
+    assert!(!rendered.contains("invite-token"));
 }
 
 #[test]
@@ -232,7 +250,8 @@ pub(super) fn dashboard_formatter_renders_invite_and_waiting_events_into_mesh_hi
         .expect("waiting render should succeed");
 
     assert!(dashboard.contains("Mesh events (latest 4)"));
-    assert!(dashboard.contains("Invite created for mesh mesh-123: invite-token"));
+    assert!(dashboard.contains("Invite created for mesh mesh-123 (token withheld for privacy)"));
+    assert!(!dashboard.contains("invite-token"));
     assert!(dashboard.contains("Waiting for peers..."));
     assert!(!dashboard.contains('📡'));
     for line in dashboard
@@ -971,7 +990,8 @@ pub(super) fn dashboard_formatter_mesh_history_keeps_timestamps_and_emoji_readab
         assert_hh_mm_ss(&timestamp);
     }
 
-    assert!(dashboard.contains("Invite created for mesh mesh-abc: invite-token-1234567890"));
+    assert!(dashboard.contains("Invite created for mesh mesh-abc (token withheld for privacy)"));
+    assert!(!dashboard.contains("invite-token-1234567890"));
     assert!(dashboard.contains("discovering mesh via Nostr re-discovery"));
     assert!(dashboard.contains("model=Qwen3-32B: legacy capacity estimate may be stale"));
     assert!(dashboard.contains("model=Qwen3-32B: waiting for stage readiness"));
@@ -981,7 +1001,7 @@ pub(super) fn dashboard_formatter_mesh_history_keeps_timestamps_and_emoji_readab
 }
 
 #[test]
-pub(super) fn dashboard_formatter_keeps_long_names_paths_and_tokens_readable() {
+pub(super) fn dashboard_formatter_keeps_long_names_and_paths_readable_without_tokens() {
     let long_model = "Qwen3.6-35B-A3B-UD-Q4_K_XL-with-extra-routing-suffix";
     let long_token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.super.long.mesh.invite.token.payload";
     let long_llama_log = "/Users/ndizazzo/.mesh-llm/runtime/3845607/logs/llama-server-8001-with-a-very-long-name.log";
@@ -1011,7 +1031,8 @@ pub(super) fn dashboard_formatter_keeps_long_names_paths_and_tokens_readable() {
         .expect("model ready render should succeed");
 
     assert!(dashboard.contains(long_model));
-    assert!(dashboard.contains(long_token));
+    assert!(!dashboard.contains(long_token));
+    assert!(dashboard.contains("token withheld for privacy"));
     assert!(dashboard.contains(long_llama_log));
     assert!(dashboard.contains("Mesh events (latest 8)"));
     assert!(dashboard.contains("│ llama-server   starting   port=8001"));

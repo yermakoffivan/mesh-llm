@@ -46,6 +46,10 @@ impl Node {
                 }
                 Ok(())
             }
+            (ApplyResult::AppliedWithRestartRequired { revision, .. }, _) => {
+                let _ = revision_tx.send(revision);
+                Ok(())
+            }
             (
                 ApplyResult::PersistedWithRevisionTrackingError {
                     revision, error, ..
@@ -123,6 +127,10 @@ impl Node {
                 if apply_mode == ConfigApplyMode::Staged {
                     let _ = revision_tx.send(revision);
                 }
+                Ok(settings)
+            }
+            (ApplyResult::AppliedWithRestartRequired { revision, .. }, _, settings) => {
+                let _ = revision_tx.send(revision);
                 Ok(settings)
             }
             (

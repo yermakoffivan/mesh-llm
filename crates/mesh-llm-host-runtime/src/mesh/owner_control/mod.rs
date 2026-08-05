@@ -761,7 +761,7 @@ impl Node {
         let apply_result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             preflight_pushed_config_for_current_node(&mesh_config)?;
             let mut state = config_state.blocking_lock();
-            let result = state.apply(mesh_config, expected_revision);
+            let result = state.apply_with_live_logging(mesh_config, expected_revision);
             let current_revision = state.revision();
             let current_hash = *state.config_hash();
             Ok((result, current_revision, current_hash))
@@ -793,7 +793,7 @@ impl Node {
                 apply_mode,
                 diagnostics,
             } => {
-                if apply_mode == ConfigApplyMode::Staged {
+                if apply_mode != ConfigApplyMode::Noop {
                     let _ = self.config_revision_tx.send(revision);
                 }
                 owner_control_response::apply_response_envelope(
@@ -804,6 +804,26 @@ impl Node {
                         config_hash: hash.to_vec(),
                         error: None,
                         apply_mode: owner_control_response::proto_apply_mode(apply_mode),
+                        diagnostics: owner_control_response::config_diagnostics_to_proto(
+                            &diagnostics,
+                        ),
+                    },
+                )
+            }
+            ApplyResult::AppliedWithRestartRequired {
+                revision,
+                hash,
+                diagnostics,
+            } => {
+                let _ = self.config_revision_tx.send(revision);
+                owner_control_response::apply_response_envelope(
+                    request_id,
+                    crate::proto::node::OwnerControlApplyConfigResponse {
+                        success: true,
+                        current_revision: revision,
+                        config_hash: hash.to_vec(),
+                        error: None,
+                        apply_mode: ConfigApplyMode::Staged as i32,
                         diagnostics: owner_control_response::config_diagnostics_to_proto(
                             &diagnostics,
                         ),

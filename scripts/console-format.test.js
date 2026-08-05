@@ -4,7 +4,7 @@ const { spawn } = require("node:child_process");
 
 const { extractDetails, format } = require("./console-format.js");
 
-test("extractDetails keeps invite token details", () => {
+test("extractDetails keeps safe invite readiness metadata without the token", () => {
   const details = extractDetails({
     event: "invite_token",
     level: "info",
@@ -13,7 +13,8 @@ test("extractDetails keeps invite token details", () => {
     message: "invite token ready",
   });
 
-  assert.deepEqual(details, ["token=tok_123", "mesh=mesh_abc"]);
+  assert.deepEqual(details, ["invitation=ready", "mesh=mesh_abc"]);
+  assert.equal(details.some((detail) => detail.includes("tok_123")), false);
 });
 
 test("extractDetails renders native debug params", () => {

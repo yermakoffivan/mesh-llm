@@ -444,36 +444,13 @@ impl DashboardEventsFilterState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DashboardJoinTokenState {
-    pub(super) token: String,
     pub(super) mesh_id: String,
     pub(super) mesh_name: Option<String>,
-    pub(super) copy_status: DashboardJoinTokenCopyStatus,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum DashboardJoinTokenCopyStatus {
-    Idle,
-    Copied { at: Instant },
-    Failed { message: String, at: Instant },
-}
-
-impl DashboardJoinTokenCopyStatus {
-    pub(super) fn feedback_at(&self) -> Option<Instant> {
-        match self {
-            Self::Idle => None,
-            Self::Copied { at } | Self::Failed { at, .. } => Some(*at),
-        }
-    }
 }
 
 impl DashboardJoinTokenState {
-    pub(super) fn new(token: String, mesh_id: String, mesh_name: Option<String>) -> Self {
-        Self {
-            token,
-            mesh_id,
-            mesh_name,
-            copy_status: DashboardJoinTokenCopyStatus::Idle,
-        }
+    pub(super) fn new(mesh_id: String, mesh_name: Option<String>) -> Self {
+        Self { mesh_id, mesh_name }
     }
 
     pub(super) fn mesh_label(&self) -> String {

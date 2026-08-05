@@ -85,12 +85,10 @@ impl OutputEventPresentation for OutputEvent {
                 None => format!("⚠️ {message}"),
             },
             OutputEvent::InviteToken {
-                token,
-                mesh_id,
-                mesh_name,
+                mesh_id, mesh_name, ..
             } => {
                 let mesh_label = format_invite_mesh_label(mesh_name.as_deref(), mesh_id);
-                format!("📡 Invite created for mesh {mesh_label}: {token}")
+                format!("📡 Invite created for mesh {mesh_label} (token withheld for privacy)")
             }
             OutputEvent::WaitingForPeers { detail } => detail
                 .clone()
@@ -273,11 +271,9 @@ impl OutputEventPresentation for OutputEvent {
                 json!({ "node_id": node_id, "mesh_id": mesh_id })
             }
             OutputEvent::InviteToken {
-                token,
-                mesh_id,
-                mesh_name,
+                mesh_id, mesh_name, ..
             } => {
-                json!({ "token": token, "mesh_id": mesh_id, "mesh_name": mesh_name })
+                json!({ "mesh_id": mesh_id, "mesh_name": mesh_name, "token_withheld": true })
             }
             OutputEvent::DiscoveryStarting { source } => json!({ "source": source }),
             OutputEvent::MeshFound {
@@ -737,13 +733,6 @@ impl InteractiveDashboardFormatter {
     pub(in crate::output) fn render_if_dirty(&mut self) -> io::Result<bool> {
         if self.panic_restored() {
             return Ok(false);
-        }
-        if self
-            .state
-            .clear_expired_join_token_copy_status(Instant::now())
-            && self.terminal_active
-        {
-            self.dirty = true;
         }
         if !self.terminal_active || !self.dirty {
             return Ok(false);

@@ -32,6 +32,8 @@ pub struct MeshConfig {
     #[serde(default)]
     pub telemetry: TelemetryConfig,
     #[serde(default)]
+    pub logging: LoggingConfig,
+    #[serde(default)]
     pub defaults: Option<ModelConfigDefaults>,
     #[serde(default)]
     pub runtime: RuntimeConfig,
@@ -1038,6 +1040,8 @@ struct RawMeshConfig {
     #[serde(default)]
     telemetry: TelemetryConfig,
     #[serde(default)]
+    logging: LoggingConfig,
+    #[serde(default)]
     defaults: Option<ModelConfigDefaults>,
     #[serde(default)]
     runtime: RuntimeConfig,
@@ -1138,6 +1142,7 @@ impl<'de> Deserialize<'de> for MeshConfig {
             mesh_requirements: raw.mesh_requirements,
             owner_control: raw.owner_control,
             telemetry: raw.telemetry,
+            logging: raw.logging,
             defaults: raw.defaults,
             runtime: raw.runtime,
             models: raw.models,
@@ -1361,6 +1366,195 @@ pub struct TelemetryConfig {
 pub struct TelemetryMetricsConfig {
     #[serde(default)]
     pub endpoint: Option<String>,
+}
+
+/// Capture mode for logging artifacts. `MetadataOnly` is the default to avoid
+/// persisting sensitive content by accident; opt into `RedactedArtifacts` only
+/// when explicit redaction guarantees are acceptable.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureMode {
+    #[default]
+    MetadataOnly,
+    RedactedArtifacts,
+}
+
+/// Configuration for the operator logging subsystem. Additive config-v1 section; existing TOML files parse unchanged.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LoggingConfig {
+    /// Whether the logging subsystem is enabled (default: true).
+    #[serde(default = "default_logging_enabled")]
+    pub enabled: bool,
+
+    /// Optional override for the application-state root directory. When absent, uses the runtime default path. Rejects unsafe roots (world-writable, escaping, empty).
+    #[serde(default)]
+    pub application_state_root: Option<std::path::PathBuf>,
+
+    /// Maximum number of summary lines captured per event batch (default: 2048). Must be at least 1 and at most 65536.
+    #[serde(default = "default_summary_limit")]
+    pub summary_line_limit: u64,
+
+    /// Maximum events buffered before flush (default: 10000). Must be between 50 and 100_000.
+    #[serde(default = "default_event_buffer_size")]
+    pub event_buffer_size: u64,
+
+    /// Retention TTL in seconds for application-state data (default: 36 hours / 129_600s). Must be between 3600 and 7_776_000.
+    #[serde(default = "default_retention_ttl_secs")]
+    pub retention_ttl_secs: u64,
+
+    /// Maximum replay capacity in events (default: 128). Must be at least 1 and at most 10_000.
+    #[serde(default = "default_replay_capacity")]
+    pub replay_capacity: u32,
+
+    /// Maximum queue capacity for outbound log dispatch (default: 4096). Must be between 64 and 131_072.
+    #[serde(default = "default_queue_capacity")]
+    pub queue_capacity: u32,
+
+    /// Artifact capture configuration.
+    #[serde(default)]
+    pub artifact: LoggingArtifactConfig,
+
+    /// Maximum export batch size in bytes (default: 5 MB). Must be between 64 KiB and 100 MiB.
+    #[serde(default = "default_export_limit_bytes")]
+    pub export_limit_bytes: u64,
+
+    /// Cleanup cadence in seconds (default: every hour / 3600s). Must be between 300 and 86_400.
+    #[serde(default = "default_cleanup_cadence_secs")]
+    pub cleanup_cadence_secs: u64,
+
+    /// Webhook dispatch configuration.
+    #[serde(default)]
+    pub webhook: LoggingWebhookConfig,
+}
+
+fn default_logging_enabled() -> bool {
+    true
+}
+
+fn default_summary_limit() -> u64 {
+    2048
+}
+
+fn default_event_buffer_size() -> u64 {
+    10_000
+}
+
+fn default_retention_ttl_secs() -> u64 {
+    36 * 3600 // 36 hours
+}
+
+fn default_replay_capacity() -> u32 {
+    128
+}
+
+fn default_queue_capacity() -> u32 {
+    4096
+}
+
+fn default_export_limit_bytes() -> u64 {
+    5 * 1024 * 1024 // 5 MB
+}
+
+fn default_cleanup_cadence_secs() -> u64 {
+    3600 // every hour
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LoggingArtifactConfig {
+    /// Capture mode: metadata-only (default) or redacted-artifacts opt-in.
+    #[serde(default)]
+    pub capture_mode: CaptureMode,
+
+    /// Maximum bytes per individual artifact before truncation (default: 256 KiB). Must be between 1024 and 16 MiB.
+    #[serde(default = "default_artifact_byte_limit")]
+    pub byte_limit_bytes: u64,
+
+    /// Aggregate byte budget across all artifacts in one batch (default: 8 MiB). Must be between 512 KiB and 500 MiB.
+    #[serde(default = "default_artifact_aggregate_bytes")]
+    pub aggregate_limit_bytes: u64,
+}
+
+fn default_artifact_byte_limit() -> u64 {
+    256 * 1024 // 256 KiB
+}
+
+fn default_artifact_aggregate_bytes() -> u64 {
+    8 * 1024 * 1024 // 8 MiB
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct LoggingWebhookConfig {
+    /// Whether webhook dispatch is enabled (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Webhook target URL. Must be a valid HTTP/HTTPS URL when set.
+    #[serde(default)]
+    pub url: Option<String>,
+
+    /// Maximum delivery attempts per event batch (default: 3). Must be between 1 and 20.
+    #[serde(default = "default_webhook_max_attempts")]
+    pub max_attempts: u32,
+
+    /// Per-attempt timeout in seconds (default: 15). Must be between 1 and 60.
+    #[serde(default = "default_webhook_timeout_secs")]
+    pub timeout_secs: u64,
+
+    /// Dead-letter retention window in seconds for failed dispatches (default: 72 hours / 259_200s). Must be between 3600 and 1_555_200.
+    #[serde(default = "default_webhook_dead_letter_secs")]
+    pub dead_letter_retention_secs: u64,
+}
+
+fn default_webhook_max_attempts() -> u32 {
+    3
+}
+
+fn default_webhook_timeout_secs() -> u64 {
+    15
+}
+
+fn default_webhook_dead_letter_secs() -> u64 {
+    72 * 3600 // 72 hours
+}
+
+impl Default for LoggingArtifactConfig {
+    fn default() -> Self {
+        Self {
+            capture_mode: CaptureMode::default(),
+            byte_limit_bytes: default_artifact_byte_limit(),
+            aggregate_limit_bytes: default_artifact_aggregate_bytes(),
+        }
+    }
+}
+
+impl Default for LoggingWebhookConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: None,
+            max_attempts: default_webhook_max_attempts(),
+            timeout_secs: default_webhook_timeout_secs(),
+            dead_letter_retention_secs: default_webhook_dead_letter_secs(),
+        }
+    }
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_logging_enabled(),
+            application_state_root: None,
+            summary_line_limit: default_summary_limit(),
+            event_buffer_size: default_event_buffer_size(),
+            retention_ttl_secs: default_retention_ttl_secs(),
+            replay_capacity: default_replay_capacity(),
+            queue_capacity: default_queue_capacity(),
+            artifact: LoggingArtifactConfig::default(),
+            export_limit_bytes: default_export_limit_bytes(),
+            cleanup_cadence_secs: default_cleanup_cadence_secs(),
+            webhook: LoggingWebhookConfig::default(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

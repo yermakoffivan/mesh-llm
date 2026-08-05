@@ -107,7 +107,7 @@ describe('RootLayout', () => {
     expect(useStatusStreamSpy).toHaveBeenCalledWith({ enabled: true })
   })
 
-  it('passes live status-backed invite rows while keeping the configured API target', () => {
+  it('passes privacy-safe private-mesh invitation rows while keeping the configured API target', () => {
     useStatusQuerySpy.mockReturnValue({
       data: {
         node_id: 'node-1',
@@ -128,24 +128,32 @@ describe('RootLayout', () => {
     renderRootLayout('live')
 
     expect(topNavSpy).toHaveBeenCalled()
-    expect(topNavSpy.mock.calls.at(-1)?.[0]).toEqual(
+    const topNavProps = topNavSpy.mock.calls.at(-1)?.[0]
+    expect(topNavProps).toEqual(
       expect.objectContaining({
         apiUrl: 'http://127.0.0.1:3131/v1',
         apiTargetLiveness: 'live',
         version: '0.99.0',
         joinCommands: expect.arrayContaining([
-          expect.objectContaining({ label: 'Invite token', value: 'invite-token-123' }),
+          expect.objectContaining({
+            label: 'Private mesh invitations',
+            value: 'Invitation details are intentionally not shown in the console.',
+            disabled: true
+          }),
           expect.objectContaining({
             label: 'Auto join and serve command',
-            value: 'mesh-llm --auto --join invite-token-123'
+            value: 'Private-mesh join command unavailable in the console',
+            disabled: true
           }),
           expect.objectContaining({
             label: 'Client-only join command',
-            value: 'mesh-llm client --join invite-token-123'
+            value: 'Private-mesh client command unavailable in the console',
+            disabled: true
           })
         ])
       })
     )
+    expect(JSON.stringify(topNavProps)).not.toContain('invite-token-123')
     expect(footerSpy.mock.calls.at(-1)?.[0]).toEqual(expect.objectContaining({ version: '0.99.0' }))
   })
 
@@ -176,7 +184,7 @@ describe('RootLayout', () => {
     )
   })
 
-  it('falls back to the placeholder invite token when live status has not reported one yet', () => {
+  it('keeps private-mesh invitation status safe when live status has no token', () => {
     useStatusQuerySpy.mockReturnValue({
       data: {
         node_id: 'node-1',
@@ -199,15 +207,19 @@ describe('RootLayout', () => {
         apiUrl: 'http://127.0.0.1:3131/v1',
         apiTargetLiveness: 'live',
         joinCommands: expect.arrayContaining([
-          expect.objectContaining({ label: 'Invite token', value: 'Invite token unavailable', disabled: true }),
+          expect.objectContaining({
+            label: 'Private mesh invitations',
+            value: 'Invitation details are intentionally not shown in the console.',
+            disabled: true
+          }),
           expect.objectContaining({
             label: 'Auto join and serve command',
-            value: 'Auto join command unavailable',
+            value: 'Private-mesh join command unavailable in the console',
             disabled: true
           }),
           expect.objectContaining({
             label: 'Client-only join command',
-            value: 'Client-only join command unavailable',
+            value: 'Private-mesh client command unavailable in the console',
             disabled: true
           })
         ])

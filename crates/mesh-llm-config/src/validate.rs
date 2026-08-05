@@ -91,6 +91,8 @@ pub fn validate_config_diagnostics(config: &MeshConfig) -> Vec<ConfigDiagnostic>
     if let Err(diagnostic) = validate_telemetry_config(&config.telemetry) {
         diagnostics.push(diagnostic);
     }
+    diagnostics.extend(validate_logging_config(&config.logging));
+
     diagnostics.extend(validate_runtime_config(&config.runtime));
     if let Err(diagnostic) = validate_plugin_entries(&config.plugins) {
         diagnostics.push(diagnostic);
@@ -350,6 +352,222 @@ fn validate_telemetry_config(config: &TelemetryConfig) -> DiagnosticResult {
     Ok(())
 }
 
+fn validate_logging_config(config: &crate::LoggingConfig) -> Vec<ConfigDiagnostic> {
+    let mut diagnostics = Vec::new();
+
+    // Application state root validation.
+    if let Some(root) = &config.application_state_root {
+        validate_application_state_root(root, &mut diagnostics);
+    }
+
+    // Numeric bounds validation.
+    for (path, value, min, max) in [
+        (
+            "logging.summary_line_limit",
+            config.summary_line_limit,
+            1_u64,
+            65_536,
+        ),
+        (
+            "logging.event_buffer_size",
+            config.event_buffer_size,
+            50,
+            100_000,
+        ),
+        (
+            "logging.retention_ttl_secs",
+            config.retention_ttl_secs,
+            3600,      // minimum 1 hour
+            7_776_000, // maximum 90 days
+        ),
+    ] {
+        if !(min..=max).contains(&value) {
+            diagnostics.push(validation_diagnostic(
+                path,
+                format!("{path} must be between {min} and {max}, got {value}"),
+            ));
+        }
+    }
+
+    for (path, value, min, max) in [
+        (
+            "logging.replay_capacity",
+            config.replay_capacity as u64,
+            1_u64,
+            10_000,
+        ),
+        (
+            "logging.queue_capacity",
+            config.queue_capacity as u64,
+            64,
+            131_072,
+        ),
+    ] {
+        if !(min..=max).contains(&value) {
+            diagnostics.push(validation_diagnostic(
+                path,
+                format!("{path} must be between {} and {}, got {}", min, max, value),
+            ));
+        }
+    }
+
+    // Artifact byte limits.
+    for (path, value, min, max) in [
+        (
+            "logging.artifact.byte_limit_bytes",
+            config.artifact.byte_limit_bytes,
+            1024_u64,
+            16 * 1024 * 1024,
+        ),
+        (
+            "logging.artifact.aggregate_limit_bytes",
+            config.artifact.aggregate_limit_bytes,
+            512 * 1024,        // minimum 512 KiB
+            500 * 1024 * 1024, // maximum 500 MiB
+        ),
+    ] {
+        if !(min..=max).contains(&value) {
+            diagnostics.push(validation_diagnostic(
+                path,
+                format!("{path} must be between {} and {}, got {}", min, max, value),
+            ));
+        }
+    }
+
+    // Export limit.
+    let export_min = 64 * 1024_u64; // 64 KiB
+    let export_max = 100 * 1024 * 1024_u64; // 100 MiB
+    if !(export_min..=export_max).contains(&config.export_limit_bytes) {
+        diagnostics.push(validation_diagnostic(
+            "logging.export_limit_bytes",
+            format!(
+                "logging.export_limit_bytes must be between {} and {}, got {}",
+                export_min, export_max, config.export_limit_bytes
+            ),
+        ));
+    }
+
+    // Cleanup cadence.
+    if !(300..=86_400).contains(&config.cleanup_cadence_secs) {
+        diagnostics.push(validation_diagnostic(
+            "logging.cleanup_cadence_secs",
+            format!(
+                "logging.cleanup_cadence_secs must be between 300 and 86400, got {}",
+                config.cleanup_cadence_secs
+            ),
+        ));
+    }
+
+    // Webhook validation.
+    validate_webhook_config(&config.webhook, &mut diagnostics);
+
+    diagnostics
+}
+
+fn validate_application_state_root(
+    root: &std::path::PathBuf,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    if root.as_os_str().is_empty() {
+        diagnostics.push(validation_diagnostic(
+            "logging.application_state_root",
+            "logging.application_state_root must not be empty",
+        ));
+        return;
+    }
+
+    // Reject absolute system paths that should never contain application state.
+    let forbidden_prefixes = ["/", "/etc/", "/dev/", "/proc/", "/sys/"];
+    if let Some(path_str) = root.to_str() {
+        for prefix in &forbidden_prefixes {
+            if path_str == *prefix || (path_str.starts_with(prefix) && *prefix != "/") {
+                diagnostics.push(validation_diagnostic(
+                    "logging.application_state_root",
+                    format!(
+                        "logging.application_state_root must not target system directories; rejecting path starting with \"{prefix}\""
+                    ),
+                ));
+            } else if *prefix == "/" && path_str.len() <= 1 {
+                diagnostics.push(validation_diagnostic(
+                    "logging.application_state_root",
+                    "logging.application_state_root must not be the filesystem root \"/\"",
+                ));
+            }
+        }
+
+        // Reject paths that escape via symlink-like patterns.
+        if path_str.contains("..") && (path_str.starts_with("/..") || path_str.contains("/../")) {
+            diagnostics.push(validation_diagnostic(
+                "logging.application_state_root",
+                "logging.application_state_root must not contain directory traversal sequences",
+            ));
+        }
+    }
+
+    // On Unix, check for world-writable if path exists.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(metadata) = std::fs::metadata(root) {
+            let mode = metadata.mode() & 0o777;
+            if mode & 0o002 != 0 {
+                diagnostics.push(validation_diagnostic(
+                    "logging.application_state_root",
+                    format!(
+                        "logging.application_state_root must not be world-writable; current mode is {:04o}",
+                        metadata.mode() & 0o7777
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+fn validate_webhook_config(
+    config: &crate::LoggingWebhookConfig,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    if let Some(ref url) = config.url
+        && let Err(diag) = validate_optional_http_url(Some(url), "logging.webhook.url")
+    {
+        diagnostics.push(diag);
+    }
+
+    for (path, value, min, max) in [
+        (
+            "logging.webhook.max_attempts",
+            config.max_attempts as u64,
+            1_u64,
+            20,
+        ),
+        (
+            "logging.webhook.timeout_secs",
+            config.timeout_secs,
+            1_u64,
+            60,
+        ),
+    ] {
+        if !(min..=max).contains(&value) {
+            diagnostics.push(validation_diagnostic(
+                path,
+                format!("{path} must be between {} and {}, got {}", min, max, value),
+            ));
+        }
+    }
+
+    // Dead-letter retention.
+    let dlr = config.dead_letter_retention_secs;
+    if !(3600..=1_555_200).contains(&dlr) {
+        diagnostics.push(validation_diagnostic(
+            "logging.webhook.dead_letter_retention_secs",
+            format!(
+                "logging.webhook.dead_letter_retention_secs must be between 3600 and 1555200, got {}",
+                dlr
+            ),
+        ));
+    }
+}
+
 #[cfg(test)]
 mod schema_tests {
     use super::*;
@@ -594,5 +812,52 @@ resume_debounce_secs = 300
             let diagnostics = validate_config_diagnostics(&config);
             assert!(diagnostics.is_empty());
         }
+    }
+
+    #[test]
+    fn config_v1_without_logging_section_applies_bounded_defaults() {
+        // Regression: existing v1 configs without [logging] must parse cleanly,
+        // produce zero diagnostics, and apply bounded metadata-only defaults.
+        let toml = r#"
+[runtime]
+bind_port = 9337
+
+[owner_control]
+bind_addr = "0.0.0.0"
+"#;
+
+        let config: MeshConfig =
+            toml::from_str(toml).expect("v1 config without [logging] should parse");
+
+        // Zero validation warnings for missing logging section.
+        let diagnostics = validate_config_diagnostics(&config);
+        assert!(
+            diagnostics.is_empty(),
+            "Expected zero diagnostics; got {:?}",
+            diagnostics
+        );
+
+        // Logging subsystem enabled by default with bounded defaults.
+        assert!(
+            config.logging.enabled,
+            "logging.enabled should default to true"
+        );
+        assert_eq!(config.logging.summary_line_limit, 2048);
+        assert_eq!(config.logging.event_buffer_size, 10_000);
+        assert_eq!(config.logging.retention_ttl_secs, 36 * 3600); // 36 hours
+        assert_eq!(config.logging.replay_capacity, 128);
+        assert_eq!(config.logging.queue_capacity, 4096);
+        assert_eq!(config.logging.export_limit_bytes, 5 * 1024 * 1024); // 5 MB
+        assert_eq!(config.logging.cleanup_cadence_secs, 3600);
+
+        // Artifact capture defaults to safe metadata-only (no raw content).
+        use crate::model::CaptureMode;
+        assert_eq!(
+            config.logging.artifact.capture_mode,
+            CaptureMode::MetadataOnly
+        );
+
+        // Webhook disabled by default.
+        assert!(!config.logging.webhook.enabled);
     }
 }

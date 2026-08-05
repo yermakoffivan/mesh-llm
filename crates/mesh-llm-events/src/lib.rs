@@ -7,6 +7,7 @@ use std::io::{self, IsTerminal};
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, RwLock};
 
+pub mod logging;
 pub mod terminal_progress;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]

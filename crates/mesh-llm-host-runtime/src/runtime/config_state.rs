@@ -1,5 +1,11 @@
 use anyhow::Result;
-use mesh_llm_config::{ConfigDiagnostic, ConfigDiagnosticSeverity, legacy_validation_error_text};
+use mesh_llm_config::{
+    ConfigDiagnostic, ConfigDiagnosticSeverity, ConfigPath, LoggingConfig,
+    built_in_config_schema_descriptor, legacy_validation_error_text,
+};
+
+// Disambiguate from the local proto-mirror ConfigApplyMode (Staged/Noop).
+use mesh_llm_config::ConfigApplyMode as SchemaApplyMode;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -15,6 +21,9 @@ use crate::protocol::convert::{canonical_config_hash, mesh_config_to_proto};
 pub(crate) enum ConfigApplyMode {
     /// Config written to disk and revision counter advanced.
     Staged,
+    /// Config written to disk and the installed runtime accepted the complete
+    /// dynamic change before this result was reported.
+    Live,
     /// No-op: the incoming config was identical to the current one.
     Noop,
 }
@@ -25,6 +34,11 @@ pub(crate) enum ApplyResult {
         revision: u64,
         hash: [u8; 32],
         apply_mode: ConfigApplyMode,
+        diagnostics: Vec<ConfigDiagnostic>,
+    },
+    AppliedWithRestartRequired {
+        revision: u64,
+        hash: [u8; 32],
         diagnostics: Vec<ConfigDiagnostic>,
     },
     RevisionConflict {
@@ -124,6 +138,89 @@ fn local_config_write_hash(config: &MeshConfig) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest);
     out
+}
+
+fn field_requires_restart(field_name: &str) -> bool {
+    let rendered_path = format!("logging.{field_name}");
+    let descriptor = ConfigPath::parse_rendered(&rendered_path)
+        .ok()
+        .and_then(|path| built_in_config_schema_descriptor(&path));
+
+    // Unknown/unparseable paths cannot acquire a live-apply contract by
+    // accident; validation will reject them before a config is persisted.
+    descriptor.is_none_or(|schema| schema.apply_mode != SchemaApplyMode::DynamicApply)
+}
+
+fn logging_changes_require_restart(old: &LoggingConfig, new: &LoggingConfig) -> bool {
+    let changed = [
+        ("enabled", old.enabled != new.enabled),
+        (
+            "application_state_root",
+            old.application_state_root != new.application_state_root,
+        ),
+        (
+            "summary_line_limit",
+            old.summary_line_limit != new.summary_line_limit,
+        ),
+        (
+            "event_buffer_size",
+            old.event_buffer_size != new.event_buffer_size,
+        ),
+        (
+            "retention_ttl_secs",
+            old.retention_ttl_secs != new.retention_ttl_secs,
+        ),
+        (
+            "replay_capacity",
+            old.replay_capacity != new.replay_capacity,
+        ),
+        ("queue_capacity", old.queue_capacity != new.queue_capacity),
+        (
+            "artifact.capture_mode",
+            old.artifact.capture_mode != new.artifact.capture_mode,
+        ),
+        (
+            "artifact.byte_limit_bytes",
+            old.artifact.byte_limit_bytes != new.artifact.byte_limit_bytes,
+        ),
+        (
+            "artifact.aggregate_limit_bytes",
+            old.artifact.aggregate_limit_bytes != new.artifact.aggregate_limit_bytes,
+        ),
+        (
+            "export_limit_bytes",
+            old.export_limit_bytes != new.export_limit_bytes,
+        ),
+        (
+            "cleanup_cadence_secs",
+            old.cleanup_cadence_secs != new.cleanup_cadence_secs,
+        ),
+        (
+            "webhook.enabled",
+            old.webhook.enabled != new.webhook.enabled,
+        ),
+        ("webhook.url", old.webhook.url != new.webhook.url),
+        (
+            "webhook.max_attempts",
+            old.webhook.max_attempts != new.webhook.max_attempts,
+        ),
+        (
+            "webhook.timeout_secs",
+            old.webhook.timeout_secs != new.webhook.timeout_secs,
+        ),
+        (
+            "webhook.dead_letter_retention_secs",
+            old.webhook.dead_letter_retention_secs != new.webhook.dead_letter_retention_secs,
+        ),
+    ];
+
+    changed
+        .into_iter()
+        .any(|(field, differs)| differs && field_requires_restart(field))
+}
+
+fn logging_dynamic_limits_changed(old: &LoggingConfig, new: &LoggingConfig) -> bool {
+    old.retention_ttl_secs != new.retention_ttl_secs || old.replay_capacity != new.replay_capacity
 }
 
 impl Default for ConfigState {
@@ -229,16 +326,94 @@ impl ConfigState {
             };
         }
 
+        let old_logging = self.config.logging.clone();
         self.config = new_config;
         self.config_hash = new_hash;
         self.last_write_config_hash = new_write_hash;
         self.revision = new_revision;
 
-        ApplyResult::Applied {
-            revision: self.revision,
-            hash: self.config_hash,
-            apply_mode: ConfigApplyMode::Staged,
-            diagnostics,
+        if logging_changes_require_restart(&old_logging, &self.config.logging) {
+            ApplyResult::AppliedWithRestartRequired {
+                revision: self.revision,
+                hash: self.config_hash,
+                diagnostics,
+            }
+        } else {
+            ApplyResult::Applied {
+                revision: self.revision,
+                hash: self.config_hash,
+                apply_mode: ConfigApplyMode::Staged,
+                diagnostics,
+            }
+        }
+    }
+
+    /// Apply configuration and, only for a dynamic-only logging limits change,
+    /// update the installed local logging runtime before advertising `Live`.
+    ///
+    /// Static logging changes always flow through [`Self::apply`] untouched,
+    /// even when they are submitted with new dynamic values. An unavailable
+    /// runtime likewise leaves the valid configuration staged: this preserves
+    /// an operator's desired settings without claiming a live mutation.
+    pub(crate) fn apply_with_live_logging(
+        &mut self,
+        new_config: MeshConfig,
+        expected_revision: u64,
+    ) -> ApplyResult {
+        let old_config = self.config.clone();
+        let limits_change =
+            logging_dynamic_limits_changed(&old_config.logging, &new_config.logging);
+        let dynamic_only = limits_change
+            && !logging_changes_require_restart(&old_config.logging, &new_config.logging);
+
+        // Preflight avoids touching a live runtime for rejected, conflicting,
+        // or no-op writes. `apply` repeats these checks as the mutating source
+        // of truth immediately after the short live-runtime operation.
+        if !dynamic_only
+            || expected_revision != self.revision
+            || local_config_write_hash(&new_config) == self.last_write_config_hash
+            || validate_config_diagnostics_with_installed_plugin_schemas(
+                &new_config,
+                config_to_toml(&new_config).ok().as_deref(),
+            )
+            .iter()
+            .any(|diagnostic| diagnostic.severity == ConfigDiagnosticSeverity::Error)
+        {
+            return self.apply(new_config, expected_revision);
+        }
+
+        if crate::apply_live_logging_limits(&new_config.logging).is_err() {
+            tracing::warn!(
+                "Logging runtime unavailable; retaining dynamic logging settings as staged configuration"
+            );
+            return self.apply(new_config, expected_revision);
+        }
+
+        match self.apply(new_config, expected_revision) {
+            ApplyResult::Applied {
+                revision,
+                hash,
+                diagnostics,
+                ..
+            } => ApplyResult::Applied {
+                revision,
+                hash,
+                apply_mode: ConfigApplyMode::Live,
+                diagnostics,
+            },
+            result @ ApplyResult::PersistedWithRevisionTrackingError { .. } => {
+                // The primary config write succeeded and `ConfigState` has
+                // already adopted the new revision. Keep the live pair in
+                // place; only revision-sidecar recovery needs attention.
+                result
+            }
+            result => {
+                // A persistence failure after an infallible in-memory live
+                // apply is rare, but restore the prior pair before exposing
+                // the failure so configuration and service do not diverge.
+                let _ = crate::apply_live_logging_limits(&old_config.logging);
+                result
+            }
         }
     }
 }
@@ -270,6 +445,9 @@ mod tests {
         severity: &'static str,
         code: &'static str,
     }
+
+    type LoggingConfigChange = (&'static str, fn(&mut LoggingConfig));
+    type MeshConfigChange = (&'static str, fn(&mut MeshConfig));
 
     impl DiagnosticSignature {
         fn new(
@@ -355,6 +533,7 @@ mod tests {
             runtime: Default::default(),
             models: vec![],
             plugins: vec![],
+            logging: Default::default(),
             extra: Default::default(),
         }
     }
@@ -806,6 +985,7 @@ reasoning_format = "qwen"
                 ..Default::default()
             }],
             plugins: vec![],
+            logging: Default::default(),
             extra: Default::default(),
         };
 
@@ -852,6 +1032,7 @@ reasoning_format = "qwen"
                 ..Default::default()
             }],
             plugins: vec![],
+            logging: Default::default(),
             extra: Default::default(),
         };
         state.apply(config_with_model, 0);
@@ -1229,6 +1410,7 @@ temperature = 0.2
                 ..Default::default()
             }],
             plugins: vec![],
+            logging: Default::default(),
             extra: Default::default(),
         };
 
@@ -1411,6 +1593,221 @@ temperature = 0.2
                 assert_ne!(first_hash, hash, "request-default change must update hash");
             }
             other => panic!("expected Applied, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn retention_and_replay_logging_changes_remain_staged_without_restart() {
+        let dir = test_dir();
+        let config_path = dir.join("config.toml");
+        let mut state = ConfigState::load(&config_path).expect("load");
+
+        // Apply baseline config first.
+        let base_config = minimal_valid_config();
+        match state.apply(base_config.clone(), 0) {
+            ApplyResult::Applied {
+                revision,
+                apply_mode,
+                ..
+            } => {
+                assert_eq!(revision, 1);
+                assert_eq!(apply_mode, ConfigApplyMode::Staged);
+            }
+            other => panic!("expected Applied for baseline, got {other:?}"),
+        }
+
+        // When: change only DynamicApply fields. This config state does not
+        // apply them to a running service; it stages the persisted revision.
+        let mut changed = base_config;
+        changed.logging.retention_ttl_secs = 72 * 3600;
+        changed.logging.replay_capacity = 256;
+
+        match state.apply(changed, 1) {
+            ApplyResult::Applied {
+                revision,
+                apply_mode,
+                ..
+            } => {
+                assert_eq!(revision, 2);
+                assert_eq!(apply_mode, ConfigApplyMode::Staged);
+            }
+            other => panic!("expected staged apply for dynamic change, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn logging_change_classifier_requires_restart_for_every_static_setting() {
+        let base = minimal_valid_config().logging;
+        let changes: [LoggingConfigChange; 15] = [
+            ("enabled", |config| config.enabled = !config.enabled),
+            ("application_state_root", |config| {
+                config.application_state_root = Some(PathBuf::from("logging-state"));
+            }),
+            ("summary_line_limit", |config| {
+                config.summary_line_limit += 1
+            }),
+            ("event_buffer_size", |config| config.event_buffer_size += 1),
+            ("queue_capacity", |config| config.queue_capacity += 1),
+            ("artifact.capture_mode", |config| {
+                config.artifact.capture_mode = mesh_llm_config::CaptureMode::RedactedArtifacts;
+            }),
+            ("artifact.byte_limit_bytes", |config| {
+                config.artifact.byte_limit_bytes += 1;
+            }),
+            ("artifact.aggregate_limit_bytes", |config| {
+                config.artifact.aggregate_limit_bytes += 1;
+            }),
+            ("export_limit_bytes", |config| {
+                config.export_limit_bytes += 1
+            }),
+            ("cleanup_cadence_secs", |config| {
+                config.cleanup_cadence_secs += 1
+            }),
+            ("webhook.enabled", |config| {
+                config.webhook.enabled = !config.webhook.enabled
+            }),
+            ("webhook.url", |config| {
+                config.webhook.url = Some("https://example.test/logs".into());
+            }),
+            ("webhook.max_attempts", |config| {
+                config.webhook.max_attempts += 1
+            }),
+            ("webhook.timeout_secs", |config| {
+                config.webhook.timeout_secs += 1
+            }),
+            ("webhook.dead_letter_retention_secs", |config| {
+                config.webhook.dead_letter_retention_secs += 1;
+            }),
+        ];
+
+        for (name, change) in changes {
+            let mut changed = base.clone();
+            change(&mut changed);
+            assert!(
+                logging_changes_require_restart(&base, &changed),
+                "logging.{name} must be restart-required"
+            );
+        }
+
+        let dynamic_changes: [LoggingConfigChange; 2] = [
+            (
+                "retention_ttl_secs",
+                (|config: &mut LoggingConfig| config.retention_ttl_secs += 1)
+                    as fn(&mut LoggingConfig),
+            ),
+            (
+                "replay_capacity",
+                (|config: &mut LoggingConfig| config.replay_capacity += 1)
+                    as fn(&mut LoggingConfig),
+            ),
+        ];
+        for (name, change) in dynamic_changes {
+            let mut changed = base.clone();
+            change(&mut changed);
+            assert!(
+                !logging_changes_require_restart(&base, &changed),
+                "logging.{name} must remain dynamically applicable"
+            );
+        }
+
+        assert!(
+            field_requires_restart("unsupported_future_setting"),
+            "unknown logging settings must not accidentally receive live-apply semantics"
+        );
+    }
+
+    #[test]
+    fn dynamic_limit_change_combined_with_static_change_stays_restart_required() {
+        let old = minimal_valid_config().logging;
+        let mut new = old.clone();
+        new.retention_ttl_secs += 1;
+        new.replay_capacity += 1;
+        new.queue_capacity += 1;
+
+        assert!(
+            logging_changes_require_restart(&old, &new),
+            "a static logging change must not be hidden by an earlier dynamic change"
+        );
+    }
+
+    #[test]
+    fn dynamic_logging_change_does_not_mask_later_nested_static_change() {
+        let dir = test_dir();
+        let config_path = dir.join("config.toml");
+        let mut state = ConfigState::load(&config_path).expect("load");
+
+        let base_config = minimal_valid_config();
+        match state.apply(base_config.clone(), 0) {
+            ApplyResult::Applied { revision, .. } => assert_eq!(revision, 1),
+            other => panic!("expected Applied for baseline, got {other:?}"),
+        }
+
+        let mut changed = base_config;
+        changed.logging.retention_ttl_secs += 3600;
+        changed.logging.artifact.byte_limit_bytes += 1024;
+
+        match state.apply(changed, 1) {
+            ApplyResult::AppliedWithRestartRequired { revision, .. } => {
+                assert_eq!(revision, 2);
+            }
+            other => panic!(
+                "expected AppliedWithRestartRequired when dynamic and nested static fields change, got {other:?}"
+            ),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn static_logging_changes_return_restart_required_from_config_state() {
+        let dir = test_dir();
+        let config_path = dir.join("config.toml");
+        let mut state = ConfigState::load(&config_path).expect("load");
+
+        // Apply baseline config first.
+        let base_config = minimal_valid_config();
+        match state.apply(base_config.clone(), 0) {
+            ApplyResult::Applied {
+                revision,
+                apply_mode,
+                ..
+            } => {
+                assert_eq!(revision, 1);
+                assert_eq!(apply_mode, ConfigApplyMode::Staged);
+            }
+            other => panic!("expected Applied for baseline, got {other:?}"),
+        }
+
+        let changes: [MeshConfigChange; 4] = [
+            ("enabled", |config: &mut MeshConfig| {
+                config.logging.enabled = !config.logging.enabled;
+            }),
+            ("queue_capacity", |config: &mut MeshConfig| {
+                config.logging.queue_capacity += 1;
+            }),
+            ("cleanup_cadence_secs", |config: &mut MeshConfig| {
+                config.logging.cleanup_cadence_secs += 1;
+            }),
+            ("artifact.capture_mode", |config: &mut MeshConfig| {
+                config.logging.artifact.capture_mode =
+                    mesh_llm_config::CaptureMode::RedactedArtifacts;
+            }),
+        ];
+        for (index, (change_name, change)) in changes.into_iter().enumerate() {
+            let mut changed = state.config().clone();
+            change(&mut changed);
+            match state.apply(changed, index as u64 + 1) {
+                ApplyResult::AppliedWithRestartRequired { revision, .. } => {
+                    assert_eq!(revision, index as u64 + 2, "{change_name}");
+                }
+                other => {
+                    panic!("expected AppliedWithRestartRequired for {change_name}, got {other:?}")
+                }
+            }
         }
 
         std::fs::remove_dir_all(&dir).ok();

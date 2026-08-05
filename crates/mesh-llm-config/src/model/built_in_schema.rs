@@ -204,6 +204,8 @@ fn build_built_in_config_schema() -> ConfigSchema {
         ),
     ];
 
+    settings.extend(logging_settings());
+
     settings.extend(model_defaults_settings());
     settings.extend(model_entry_settings());
     settings.extend(plugin_entry_settings());
@@ -1040,6 +1042,59 @@ fn plugin_setting(path: &str, value_schema: ConfigValueSchema) -> ConfigSettingS
     setting
 }
 
+fn logging_setting(path: &str, value_schema: ConfigValueSchema) -> ConfigSettingSchema {
+    let mut setting = basic_setting(path, value_schema);
+    setting.control_surfaces = vec![ConfigControlSurface::ConfigFile];
+    // Logging settings requiring process restart (structural / path / capability changes).
+    setting.restart_scope = ConfigRestartScope::ProcessRestart;
+    setting.visibility = ConfigVisibility::Advanced;
+    setting
+}
+
+fn logging_dynamic_setting(path: &str, value_schema: ConfigValueSchema) -> ConfigSettingSchema {
+    let mut setting = basic_setting(path, value_schema);
+    setting.control_surfaces = vec![ConfigControlSurface::ConfigFile];
+    setting.apply_mode = ConfigApplyMode::DynamicApply;
+    setting.restart_scope = ConfigRestartScope::None;
+    setting.visibility = ConfigVisibility::Advanced;
+    setting
+}
+
+fn logging_settings() -> Vec<ConfigSettingSchema> {
+    vec![
+        logging_setting("logging.enabled", ConfigValueSchema::Boolean),
+        logging_setting("logging.application_state_root", ConfigValueSchema::Path),
+        logging_setting("logging.summary_line_limit", ConfigValueSchema::Integer),
+        logging_setting("logging.event_buffer_size", ConfigValueSchema::Integer),
+        // Only these two limits have a dynamic service-application contract.
+        logging_dynamic_setting("logging.retention_ttl_secs", ConfigValueSchema::Integer),
+        logging_dynamic_setting("logging.replay_capacity", ConfigValueSchema::Integer),
+        logging_setting("logging.queue_capacity", ConfigValueSchema::Integer),
+        logging_setting("logging.cleanup_cadence_secs", ConfigValueSchema::Integer),
+        logging_setting(
+            "logging.artifact.capture_mode",
+            string_enum(["metadata_only", "redacted_artifacts"]),
+        ),
+        logging_setting(
+            "logging.artifact.byte_limit_bytes",
+            ConfigValueSchema::Integer,
+        ),
+        logging_setting(
+            "logging.artifact.aggregate_limit_bytes",
+            ConfigValueSchema::Integer,
+        ),
+        logging_setting("logging.export_limit_bytes", ConfigValueSchema::Integer),
+        logging_setting("logging.webhook.enabled", ConfigValueSchema::Boolean),
+        logging_setting("logging.webhook.url", ConfigValueSchema::Url),
+        logging_setting("logging.webhook.max_attempts", ConfigValueSchema::Integer),
+        logging_setting("logging.webhook.timeout_secs", ConfigValueSchema::Integer),
+        logging_setting(
+            "logging.webhook.dead_letter_retention_secs",
+            ConfigValueSchema::Integer,
+        ),
+    ]
+}
+
 fn basic_setting(path: &str, value_schema: ConfigValueSchema) -> ConfigSettingSchema {
     ConfigSettingSchema {
         path: schema_path(path),
@@ -1334,6 +1389,54 @@ mod tests {
             assert_eq!(
                 setting.control_surfaces,
                 vec![ConfigControlSurface::ConfigFile, ConfigControlSurface::Api],
+                "{path}"
+            );
+            assert_eq!(setting.apply_mode, ConfigApplyMode::StaticOnLoad, "{path}");
+            assert_eq!(
+                setting.restart_scope,
+                ConfigRestartScope::ProcessRestart,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn logging_settings_classify_only_retention_and_replay_as_dynamic() {
+        for path in ["logging.retention_ttl_secs", "logging.replay_capacity"] {
+            let setting = schema_setting(path);
+
+            assert_eq!(
+                setting.control_surfaces,
+                vec![ConfigControlSurface::ConfigFile],
+                "{path}"
+            );
+            assert_eq!(setting.apply_mode, ConfigApplyMode::DynamicApply, "{path}");
+            assert_eq!(setting.restart_scope, ConfigRestartScope::None, "{path}");
+        }
+
+        // Static: all other logging settings require process restart.
+        for path in [
+            "logging.enabled",
+            "logging.application_state_root",
+            "logging.summary_line_limit",
+            "logging.event_buffer_size",
+            "logging.queue_capacity",
+            "logging.cleanup_cadence_secs",
+            "logging.artifact.capture_mode",
+            "logging.artifact.byte_limit_bytes",
+            "logging.artifact.aggregate_limit_bytes",
+            "logging.export_limit_bytes",
+            "logging.webhook.enabled",
+            "logging.webhook.url",
+            "logging.webhook.max_attempts",
+            "logging.webhook.timeout_secs",
+            "logging.webhook.dead_letter_retention_secs",
+        ] {
+            let setting = schema_setting(path);
+
+            assert_eq!(
+                setting.control_surfaces,
+                vec![ConfigControlSurface::ConfigFile],
                 "{path}"
             );
             assert_eq!(setting.apply_mode, ConfigApplyMode::StaticOnLoad, "{path}");

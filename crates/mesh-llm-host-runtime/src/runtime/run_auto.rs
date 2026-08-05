@@ -182,6 +182,7 @@ pub(crate) async fn run_cli(
 
 pub(crate) async fn run_embedded_runtime(mut options: EmbeddedRuntimeOptions) -> Result<()> {
     initialize_embedded_runtime_entrypoint()?;
+    crate::sdk::embedded_logging::initialize_embedded_logging(options.config_path.as_deref())?;
 
     let surface = options.runtime_surface();
     let control_rx = options.control_rx.take();

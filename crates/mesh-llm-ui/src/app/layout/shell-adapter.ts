@@ -48,25 +48,28 @@ export function resolveOpenAIBaseUrl(status?: StatusPayload) {
   return normalizeOpenAIBaseUrl(env.apiUrl)
 }
 
-function resolveInviteToken(status?: StatusPayload) {
-  return status?.token?.trim() || null
-}
-
-function buildAvailableJoinCommands(inviteToken: string): TopNavJoinCommand[] {
+function buildPrivateJoinCommands(): TopNavJoinCommand[] {
   return [
     {
-      label: 'Invite token',
-      value: inviteToken,
-      hint: 'Use the issued live token from /api/status.',
-      noWrapValue: true
+      label: 'Private mesh invitations',
+      value: 'Invitation details are intentionally not shown in the console.',
+      hint: 'Use a trusted local operator channel to issue or share a private-mesh invitation.',
+      disabled: true
     },
     {
       label: 'Auto join and serve command',
-      value: `mesh-llm --auto --join ${inviteToken}`,
+      value: 'Private-mesh join command unavailable in the console',
       prefix: '$',
-      hint: 'Matches the Connect panel flow: join, select a model, and serve the API.'
+      hint: 'Get the join command from a trusted local operator channel.',
+      disabled: true
     },
-    { label: 'Client-only join command', value: `mesh-llm client --join ${inviteToken}`, prefix: '$' }
+    {
+      label: 'Client-only join command',
+      value: 'Private-mesh client command unavailable in the console',
+      prefix: '$',
+      hint: 'Get the join command from a trusted local operator channel.',
+      disabled: true
+    }
   ]
 }
 
@@ -84,24 +87,23 @@ function buildPublicJoinCommands(): TopNavJoinCommand[] {
 function buildUnavailableJoinCommands(): TopNavJoinCommand[] {
   return [
     {
-      label: 'Invite token',
-      value: 'Invite token unavailable',
-      hint: 'Live /api/status has not reported an invite token yet.',
-      noWrapValue: true,
+      label: 'Private mesh invitations',
+      value: 'Private-mesh invitation status unavailable',
+      hint: 'Connect to a local mesh node to see safe invitation availability metadata.',
       disabled: true
     },
     {
       label: 'Auto join and serve command',
       value: 'Auto join command unavailable',
       prefix: '$',
-      hint: 'This command becomes available after the backend issues a live invite token.',
+      hint: 'Get private-mesh join commands from a trusted local operator channel.',
       disabled: true
     },
     {
       label: 'Client-only join command',
       value: 'Client-only join command unavailable',
       prefix: '$',
-      hint: 'This command becomes available after the backend issues a live invite token.',
+      hint: 'Get private-mesh join commands from a trusted local operator channel.',
       disabled: true
     }
   ]
@@ -117,12 +119,11 @@ export function resolveHarnessTopNavData(data: ShellHarnessData): TopNavShellDat
 }
 
 export function resolveLiveTopNavData(status?: StatusPayload): TopNavShellData {
-  const inviteToken = resolveInviteToken(status)
   const topNavJoinCommands =
     status && isPublicMesh(status)
       ? buildPublicJoinCommands()
-      : inviteToken
-        ? buildAvailableJoinCommands(inviteToken)
+      : status
+        ? buildPrivateJoinCommands()
         : buildUnavailableJoinCommands()
 
   return {
