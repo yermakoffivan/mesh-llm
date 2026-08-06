@@ -385,34 +385,27 @@ export function LogsLedger({
       className="mx-auto flex w-full max-w-[1440px] flex-col gap-[calc(var(--shell-normal)*2)]"
       aria-labelledby="logs-ledger-title"
     >
-      <header className="flex flex-wrap items-end justify-between gap-3 border-b border-border-soft pb-[var(--panel-y)]">
-        <div>
-          <div className="type-label text-fg-faint">Operations ledger</div>
-          <h1 className="type-display mt-1 text-foreground" id="logs-ledger-title">
-            Request logs
-          </h1>
-          <p className="type-body mt-1 max-w-[72ch] text-fg-dim">
-            Local request history, including active work and durable outcomes. This ledger is an operational index;
-            payload details remain separate.
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2" aria-live="polite">
-          {result?.state === 'supported' ? (
-            <StatusBadge dot size="caption" tone={query.isFetching ? 'accent' : liveStateTone(live.state)}>
-              {query.isFetching ? 'Updating' : liveStateLabel(live.state)}
-            </StatusBadge>
-          ) : null}
-          {result?.state === 'supported' ? (
-            <StatusBadge tone="muted" size="caption">
-              Local only
-            </StatusBadge>
-          ) : null}
-          {result?.state === 'supported' ? (
-            <LogOperations
-              onMaintenanceMutationSucceeded={onMaintenanceMutationSucceeded}
-              query={toLogsRequestQuery(search)}
-            />
-          ) : null}
+      <header className="border-b border-border-soft pb-[var(--panel-y)]">
+        <div className="flex min-h-[58px] flex-wrap items-center justify-between gap-x-4 gap-y-2 py-0" aria-live="polite">
+          <h1 className="type-headline text-foreground" id="logs-ledger-title">Request logs</h1>
+          <div className="flex flex-wrap items-center gap-2">
+            {result?.state === 'supported' ? (
+              <StatusBadge dot size="caption" tone={query.isFetching ? 'accent' : liveStateTone(live.state)}>
+                {query.isFetching ? 'Updating' : liveStateLabel(live.state)}
+              </StatusBadge>
+            ) : null}
+            {result?.state === 'supported' ? (
+              <StatusBadge tone="muted" size="caption">
+                Local only
+              </StatusBadge>
+            ) : null}
+            {result?.state === 'supported' ? (
+              <LogOperations
+                onMaintenanceMutationSucceeded={onMaintenanceMutationSucceeded}
+                query={toLogsRequestQuery(search)}
+              />
+            ) : null}
+          </div>
         </div>
       </header>
 
