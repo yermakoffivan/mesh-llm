@@ -29,6 +29,8 @@ import {
   type LogCleanupOutcome,
   type LogDeleteReceipt,
   type LogExport,
+  type LogLifecycleEvent,
+  type LogProxyAttempt,
   type LogRequest,
   type LogWebhookRetryReceipt,
   type LogsPage
@@ -268,10 +270,14 @@ export class LogsApiClient {
     return this.getJson(`/api/logs/requests/${encodeURIComponent(requestId.toString())}`, parseLogRequest)
   }
 
-  async listRequestEvents(requestId: LogRequestId, query: LogsPageQuery = {}, mode: DataMode = 'live') {
+  async listRequestEvents(
+    requestId: LogRequestId,
+    query: LogsPageQuery = {},
+    mode: DataMode = 'live'
+  ): Promise<LogsPage<LogLifecycleEvent>> {
     if (mode === 'harness') {
       const events = generateLifecycleEvents(requestId.toString())
-      return { items: events as unknown[], nextCursor: undefined }
+      return { items: events, nextCursor: undefined }
     }
     return this.getJson(
       appendQuery(`/api/logs/requests/${encodeURIComponent(requestId.toString())}/events`, serializePageQuery(query)),
@@ -279,10 +285,14 @@ export class LogsApiClient {
     )
   }
 
-  async listRequestArtifacts(requestId: LogRequestId, query: LogsPageQuery = {}, mode: DataMode = 'live') {
+  async listRequestArtifacts(
+    requestId: LogRequestId,
+    query: LogsPageQuery = {},
+    mode: DataMode = 'live'
+  ): Promise<LogsPage<LogArtifact>> {
     if (mode === 'harness') {
       const artifacts = generateArtifacts(requestId.toString())
-      return { items: artifacts as unknown[], nextCursor: undefined }
+      return { items: artifacts, nextCursor: undefined }
     }
     return this.getJson(
       appendQuery(
@@ -295,10 +305,10 @@ export class LogsApiClient {
   async getArtifact(artifactId: LogArtifactId) {
     return this.getJson(`/api/logs/artifacts/${encodeURIComponent(artifactId.toString())}`, parseLogArtifact)
   }
-  async listProxy(query: LogsProxyQuery = {}, mode: DataMode = 'live') {
+  async listProxy(query: LogsProxyQuery = {}, mode: DataMode = 'live'): Promise<LogsPage<LogProxyAttempt>> {
     if (mode === 'harness' && query.requestId) {
       const attempts = generateProxyAttempts(query.requestId.toString())
-      return { items: attempts as unknown[], nextCursor: undefined }
+      return { items: attempts, nextCursor: undefined }
     }
     const params = new URLSearchParams(serializePageQuery(query))
     setQueryValue(params, 'request_id', query.requestId?.toString())

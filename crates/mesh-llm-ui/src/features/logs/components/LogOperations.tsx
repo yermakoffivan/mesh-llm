@@ -1,6 +1,6 @@
 import * as DialogPrimitive from '@radix-ui/react-dialog'
 import { useRef, useState, type RefObject } from 'react'
-import { Download, RotateCcw, ShieldAlert, Trash2 } from 'lucide-react'
+import { Download, RotateCcw, Trash2 } from 'lucide-react'
 import {
   SharedModal,
   SharedModalActionStrip,
@@ -684,7 +684,7 @@ export function LogOperations({ query, onMaintenanceMutationSucceeded }: LogOper
         type="button"
         variant="outline"
       >
-        <ShieldAlert className="size-3.5" aria-hidden="true" />
+        <Trash2 className="size-3.5" aria-hidden="true" />
         Scoped cleanup
       </Button>
       {!supportsCleanup(query) ? (

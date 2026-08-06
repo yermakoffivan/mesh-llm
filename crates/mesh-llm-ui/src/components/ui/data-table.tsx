@@ -30,6 +30,7 @@ export type DataTableProps<TData, TValue> = {
   readonly enablePagination?: boolean
   readonly filterColumnId?: string
   readonly filterPlaceholder?: string
+  readonly footerClassName?: string | undefined
   readonly getRowId?: (row: TData) => string
   readonly tableClassName?: string
 }
@@ -45,6 +46,7 @@ export function DataTable<TData, TValue>({
   enablePagination = false,
   filterColumnId,
   filterPlaceholder = 'Filter...',
+  footerClassName,
   getRowId,
   tableClassName
 }: DataTableProps<TData, TValue>) {
@@ -130,7 +132,16 @@ export function DataTable<TData, TValue>({
           )}
         </TableBody>
       </Table>
-      {enablePagination ? <DataTablePagination table={table} /> : null}
+      {footerClassName == undefined || enablePagination ? (
+        footerClassName == undefined
+          ? enablePagination
+            ? <DataTablePagination table={table} />
+            : null
+          : enablePagination && footerClassName !== ''
+            ? <div className={cn('border-t border-border-soft', footerClassName)}><DataTablePagination table={table} /></div>
+            : null
+
+      ) : null}
     </div>
   )
 }

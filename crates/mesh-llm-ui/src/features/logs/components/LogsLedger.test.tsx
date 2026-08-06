@@ -75,13 +75,16 @@ describe('LogsLedger', () => {
 
     expect(screen.getAllByText(REQUEST_A)).toHaveLength(1)
     expect(screen.getAllByText('active')).toHaveLength(2)
-    expect(screen.getByRole('combobox', { name: 'Rows per page' })).toBeInTheDocument()
+    const rowsPerPage = screen.getByRole('combobox', { name: 'Rows per page' })
+    expect(rowsPerPage).toBeInTheDocument()
+    expect(rowsPerPage).toHaveValue(String(20))
     expect(screen.getByRole('button', { name: 'Go to previous page' })).toBeDisabled()
     expect(screen.getByRole('button', { name: 'Go to next page' })).toBeDisabled()
 
     await user.click(screen.getByRole('button', { name: `Open request ${REQUEST_A}` }))
     expect(onRequestOpen).toHaveBeenCalledWith(REQUEST_A, expect.objectContaining({ focusRequestId: REQUEST_A }))
   })
+
 
   it('clears time and category filters with an accessible reset action', async () => {
     const user = userEvent.setup()
@@ -98,12 +101,35 @@ describe('LogsLedger', () => {
     expect(onSearchChange).toHaveBeenCalledWith({})
   })
 
-  it('keeps filter controls in the keyboard order and labels the time range control', async () => {
+  it('keeps the header actions before filter controls in the keyboard order', async () => {
     const user = userEvent.setup()
-    render(<LogsLedger onRequestOpen={vi.fn()} search={parseLogsLedgerSearch({})} onSearchChange={vi.fn()} />)
+    // A filtered search keeps the Reset control enabled so it participates in the tab order.
+    render(
+      <LogsLedger
+        onRequestOpen={vi.fn()}
+        search={parseLogsLedgerSearch({ model: 'Qwen3' })}
+        onSearchChange={vi.fn()}
+      />
+    )
 
     await user.tab()
+    expect(screen.getByRole('button', { name: 'Export view' })).toHaveFocus()
+    await user.tab()
+    expect(screen.getByRole('button', { name: 'Scoped cleanup' })).toHaveFocus()
+    await user.tab()
+    expect(screen.getByRole('button', { name: 'Dead-letter retry' })).toHaveFocus()
+    await user.tab()
+    expect(screen.getByLabelText('Bucket interval')).toHaveFocus()
+    await user.tab()
+    expect(screen.getByLabelText('Chart time range')).toHaveFocus()
+    await user.tab()
+    expect(screen.getByLabelText('Filter by request ID')).toHaveFocus()
+    await user.tab()
     expect(screen.getByLabelText('Filter logs by time range')).toHaveFocus()
+    await user.tab()
+    expect(screen.getByRole('button', { name: 'Reset view' })).toHaveFocus()
+    await user.tab()
+    expect(screen.getByRole('button', { name: /^Filter request logs/ })).toHaveFocus()
   })
 
   it('filters the loaded page by request ID', async () => {
@@ -163,8 +189,10 @@ describe('LogsLedger', () => {
     queryState.current = supported([], undefined)
     render(<LogsLedger onRequestOpen={vi.fn()} search={parseLogsLedgerSearch({})} onSearchChange={vi.fn()} />)
 
-    expect(screen.getByRole('status')).toHaveTextContent('No log requests match this view')
+    expect(screen.getByRole('status')).toHaveTextContent('No log requests yet')
     expect(screen.queryByRole('table', { name: 'Request logs' })).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Filter logs by time range')).toBeInTheDocument()
+    expect(screen.getByLabelText('Filter by request ID')).toBeInTheDocument()
   })
 
   it('offers a stable, labeled retry action when the logs API fails', async () => {

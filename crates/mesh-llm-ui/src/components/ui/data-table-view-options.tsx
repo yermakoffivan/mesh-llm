@@ -1,5 +1,5 @@
 import type { Table } from '@tanstack/react-table'
-import { Settings2 } from 'lucide-react'
+import { Columns3 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
   DropdownMenu,
@@ -19,7 +19,7 @@ export function DataTableViewOptions<TData>({ table }: DataTableViewOptionsProps
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <Button className="ui-control h-8 gap-1.5 rounded-[var(--radius)] px-2.5 text-[length:var(--density-type-caption)]" size="sm" variant="outline">
-          <Settings2 className="size-3.5" aria-hidden="true" />
+          <Columns3 className="size-3.5" aria-hidden="true" />
           Columns
         </Button>
       </DropdownMenuTrigger>

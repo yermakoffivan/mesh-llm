@@ -29,6 +29,7 @@ export type FilterPopoverProps<Key extends string> = {
   onSelectAll: (key: Key) => void
   onSelectNone: (key: Key) => void
   onClear: () => void
+  triggerClassName?: string
 }
 
 export function FilterPopover<Key extends string>({
@@ -47,7 +48,8 @@ export function FilterPopover<Key extends string>({
   onValueChange,
   onSelectAll,
   onSelectNone,
-  onClear
+  onClear,
+  triggerClassName
 }: FilterPopoverProps<Key>) {
   const filtersActive = activeFilterGroups > 0
   const triggerAriaLabel = filtersActive ? `${triggerLabel}, ${activeFilterGroups} active` : triggerLabel
@@ -61,10 +63,11 @@ export function FilterPopover<Key extends string>({
           aria-haspopup="dialog"
           aria-label={triggerAriaLabel}
           className={cn(
-            'ui-control inline-flex h-7 shrink-0 items-center gap-1.5 rounded-[var(--radius)] px-2 text-[length:var(--density-type-caption)] outline-none transition-[border-color,background,color,box-shadow]',
+            'ui-control inline-flex h-8 shrink-0 items-center gap-1.5 rounded-[var(--radius)] px-2.5 text-[length:var(--density-type-caption)] outline-none transition-[border-color,background,color,box-shadow]',
             'focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent',
             filtersActive &&
-              'border-accent/45 bg-[color-mix(in_oklab,var(--color-accent)_12%,var(--color-panel))] text-fg shadow-surface-selected'
+              'border-accent/45 bg-[color-mix(in_oklab,var(--color-accent)_12%,var(--color-panel))] text-fg shadow-surface-selected',
+            triggerClassName
           )}
         >
           <Funnel aria-hidden={true} className="size-3.5" strokeWidth={1.8} />

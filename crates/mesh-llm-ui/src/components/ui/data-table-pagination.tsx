@@ -20,11 +20,7 @@ export function DataTablePagination<TData>({ table }: DataTablePaginationProps<T
   const canNextPage = table.getCanNextPage()
 
   return (
-    <div className="flex flex-wrap items-center justify-between gap-3 px-[var(--panel-x)] py-[var(--panel-y)]">
-      <span className="type-caption text-fg-faint">
-        {table.getFilteredRowModel().rows.length} row{table.getFilteredRowModel().rows.length === 1 ? '' : 's'} on
-        this page.
-      </span>
+    <div className="flex flex-wrap items-center justify-end gap-3 px-[var(--panel-x)] py-[var(--panel-y)]">
       <div className="flex flex-wrap items-center gap-3">
         <div className="flex items-center gap-2">
           <span className="type-caption text-fg-faint">Rows per page</span>

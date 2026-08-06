@@ -1,0 +1,18 @@
+
+import type { PaginationState, Table } from '@tanstack/react-table'
+
+
+
+export function DataTablePagination<TData>({ table }: DataTablePaginationProps<TData>) { 
+
+
+  return ( 
+    <Subscribe source={table.store} selector={(s) => s.pagination}> 
+
+      {(pagination: PaginationState | undefined) => {
+        const pageSize = pagination?.pageSize ?? table.getState().pagination.pageSize;
+
+
+       return (  
+         <div className="flex flex-wrap items-center justify-end gap-3 px-[var(--panel-x)] py-[var(--panel-y)]">
+
