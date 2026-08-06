@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { ArrowLeft, DatabaseZap, Download, Route, ShieldAlert, Workflow } from 'lucide-react'
+import { ArrowLeft, ChevronDown, DatabaseZap, Download, Route, ShieldAlert, Workflow } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { CopyInstructionRow } from '@/components/ui/CopyInstructionRow'
+import { Separator } from '@/components/ui/separator'
 import { StatusBadge, type StatusBadgeTone } from '@/components/ui/StatusBadge'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { LogRequestDeleteControl } from '@/features/logs/components/LogOperations'
@@ -206,49 +208,61 @@ function ArtifactMetadata({ artifact }: { readonly artifact: LogArtifact }) {
   const payloadState = artifact.contentState === 'available' ? 'retained; not loaded' : artifact.contentState
   return (
     <article className="border-b border-border-soft py-3 last:border-b-0">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="min-w-0 break-words font-mono text-[length:var(--density-type-caption-lg)] text-foreground">
-          {artifact.kind}
-        </div>
-        <StatusBadge size="caption" tone={artifactTone(artifact)}>
-          {payloadState}
-        </StatusBadge>
-      </div>
-      <dl className="mt-3 grid gap-x-[var(--shell-normal)] gap-y-2 sm:grid-cols-2 lg:grid-cols-4">
-        <div>
-          <dt className="type-label text-fg-faint">Captured</dt>
-          <dd className="mt-1 font-mono text-[length:var(--density-type-caption)] text-fg-dim">
-            {formatTimestamp(artifact.occurredAt)}
-          </dd>
-        </div>
-        <div>
-          <dt className="type-label text-fg-faint">Bytes / version</dt>
-          <dd className="mt-1 font-mono text-[length:var(--density-type-caption)] text-fg-dim">
-            {artifact.bytes} B / v{artifact.version}
-          </dd>
-        </div>
-        <div>
-          <dt className="type-label text-fg-faint">Redaction</dt>
-          <dd className="mt-1 text-[length:var(--density-type-caption)] text-fg-dim">
-            {artifact.redacted ? 'Redacted before retention' : 'Not retained as payload'}
-          </dd>
-        </div>
-        <div>
-          <dt className="type-label text-fg-faint">Truncation</dt>
-          <dd className="mt-1 text-[length:var(--density-type-caption)] text-fg-dim">
-            {artifact.truncated ? 'Truncated' : 'Complete metadata'}
-          </dd>
-        </div>
-      </dl>
-      <div className="mt-3 min-w-0 border-t border-border-soft pt-2">
-        <div className="type-label text-fg-faint">Checksum</div>
-        <div className="mt-1 break-all font-mono text-[length:var(--density-type-caption)] text-fg-dim">
-          {artifact.checksum ?? 'Not recorded'}
-        </div>
-      </div>
-      {artifact.contentState === 'available' && artifact.redacted ? (
-        <ArtifactDownloadControl artifact={artifact} />
-      ) : null}
+      <Collapsible defaultOpen>
+        <CollapsibleTrigger className="group flex w-full flex-wrap items-center justify-between gap-2 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+          <div className="min-w-0 break-words font-mono text-[length:var(--density-type-caption-lg)] text-foreground">
+            {artifact.kind}
+          </div>
+          <div className="flex items-center gap-2">
+            <StatusBadge size="caption" tone={artifactTone(artifact)}>
+              {payloadState}
+            </StatusBadge>
+            <span className="type-caption text-fg-faint" aria-hidden="true">
+              <ChevronDown className="size-3.5 transition-transform group-data-[state=open]:rotate-180" />
+            </span>
+          </div>
+        </CollapsibleTrigger>
+        <CollapsibleContent>
+          <dl className="mt-3 grid gap-x-[var(--shell-normal)] gap-y-2 sm:grid-cols-2 lg:grid-cols-4">
+            <div>
+              <dt className="type-label text-fg-faint">Captured</dt>
+              <dd className="mt-1 font-mono text-[length:var(--density-type-caption)] text-fg-dim">
+                {formatTimestamp(artifact.occurredAt)}
+              </dd>
+            </div>
+            <div>
+              <dt className="type-label text-fg-faint">Bytes / version</dt>
+              <dd className="mt-1 font-mono text-[length:var(--density-type-caption)] text-fg-dim">
+                {artifact.bytes} B / v{artifact.version}
+              </dd>
+            </div>
+            <div>
+              <dt className="type-label text-fg-faint">Redaction</dt>
+              <dd className="mt-1 text-[length:var(--density-type-caption)] text-fg-dim">
+                {artifact.redacted ? 'Redacted before retention' : 'Not retained as payload'}
+              </dd>
+            </div>
+            <div>
+              <dt className="type-label text-fg-faint">Truncation</dt>
+              <dd className="mt-1 text-[length:var(--density-type-caption)] text-fg-dim">
+                {artifact.truncated ? 'Truncated' : 'Complete metadata'}
+              </dd>
+            </div>
+          </dl>
+          <div className="mt-3 min-w-0">
+            <Separator />
+            <div className="mt-2">
+              <div className="type-label text-fg-faint">Checksum</div>
+              <div className="mt-1 break-all font-mono text-[length:var(--density-type-caption)] text-fg-dim">
+                {artifact.checksum ?? 'Not recorded'}
+              </div>
+            </div>
+          </div>
+          {artifact.contentState === 'available' && artifact.redacted ? (
+            <ArtifactDownloadControl artifact={artifact} />
+          ) : null}
+        </CollapsibleContent>
+      </Collapsible>
     </article>
   )
 }
@@ -556,16 +570,19 @@ export function LogRequestDetails({
                 />
               ) : null}
             </div>
-            <div className="mt-4 border-t border-border-soft pt-3">
-              <DatabaseZap className="mr-2 inline size-4 text-fg-faint" aria-hidden="true" />
-              <span className="type-label text-fg-faint">Error artifacts</span>
-              <div className="mt-2">
-                <ArtifactPanel
-                  artifacts={artifactsQuery.data?.items}
-                  error={artifactsQuery.isError}
-                  kind="errors"
-                  loading={artifactsQuery.isLoading}
-                />
+            <div className="mt-4">
+              <Separator />
+              <div className="pt-3">
+                <DatabaseZap className="mr-2 inline size-4 text-fg-faint" aria-hidden="true" />
+                <span className="type-label text-fg-faint">Error artifacts</span>
+                <div className="mt-2">
+                  <ArtifactPanel
+                    artifacts={artifactsQuery.data?.items}
+                    error={artifactsQuery.isError}
+                    kind="errors"
+                    loading={artifactsQuery.isLoading}
+                  />
+                </div>
               </div>
             </div>
           </TabsContent>

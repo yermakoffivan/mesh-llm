@@ -114,9 +114,9 @@ describe('useLogsLiveRecovery', () => {
   })
 
   it('serializes active stream-supported filters into the dedicated logs stream', async () => {
+    vi.useFakeTimers({ now: new Date('2026-08-04T12:30:00Z') })
     const search: LogsLedgerSearch = {
-      from: '2026-08-01T00:00:00Z',
-      to: '2026-08-04T00:00:00Z',
+      timeRange: '7d' as const,
       model: 'Qwen3',
       provider: 'reserve-a',
       engine: 'skippy',
@@ -131,7 +131,7 @@ describe('useLogsLiveRecovery', () => {
     await flush()
     expect(hydrate).toHaveBeenCalledTimes(1)
     expect(sources[0]?.url).toBe(
-      '/api/logs/events?channel=requests&channel=operations&filter=from%3A2026-08-01T00%3A00%3A00Z&filter=to%3A2026-08-04T00%3A00%3A00Z&filter=model%3AQwen3&filter=provider%3Areserve-a&filter=engine%3Askippy&filter=route%3Achat&filter=outcome%3Acompleted'
+      '/api/logs/events?channel=requests&channel=operations&filter=from%3A2026-07-28T12%3A30%3A00.000Z&filter=to%3A2026-08-04T12%3A30%3A00.000Z&filter=model%3AQwen3&filter=provider%3Areserve-a&filter=engine%3Askippy&filter=route%3Achat&filter=outcome%3Acompleted'
     )
     act(() => sources[0]?.open())
     expect(result.current.state).toBe('connected')

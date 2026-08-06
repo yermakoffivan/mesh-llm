@@ -1,19 +1,24 @@
 import { useCallback, useEffect, useMemo } from 'react'
 import { RefreshCw } from 'lucide-react'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { FilterPopover, type FilterCategory, type FilterValueOption } from '@/components/ui/FilterPopover'
-import { Input } from '@/components/ui/input'
+import { NativeSelect } from '@/components/ui/NativeSelect'
+import { ScrollArea } from '@/components/ui/scroll-area'
 import { StatusBadge, type StatusBadgeTone } from '@/components/ui/StatusBadge'
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { DataTable } from '@/components/ui/data-table'
+import { DataTableViewOptions } from '@/components/ui/data-table-view-options'
 import { useLogsLedgerQuery } from '@/features/logs/api/use-logs-ledger-query'
 import { useLogsLiveRecovery, type LogsLiveConnectionState } from '@/features/logs/api/use-logs-live-recovery'
 import { LogOperations } from '@/features/logs/components/LogOperations'
+import { buildLogsLedgerColumns } from '@/features/logs/components/LogsLedgerColumns'
 import type { LogRequest } from '@/features/logs/api/schemas'
 import {
-  advanceLogsPage,
+  RELATIVE_TIME_PRESETS,
   resetLogsSearch,
   toLogsRequestQuery,
   updateLogsFilter,
+  updateLogsTimeRange,
   type LogsLedgerSearch
 } from '@/features/logs/lib/log-search'
 
@@ -34,35 +39,6 @@ const ledgerFilterCategories: Array<FilterCategory<LedgerFilterKey>> = [
   { key: 'source', label: 'Source' },
   { key: 'outcome', label: 'Outcome' }
 ]
-
-function optionalFilterValue(value: string | undefined) {
-  return value ?? ''
-}
-
-function requestTone(outcome: LogRequest['outcome']): StatusBadgeTone {
-  switch (outcome) {
-    case 'active':
-      return 'accent'
-    case 'completed':
-      return 'good'
-    case 'failed':
-    case 'rejected':
-    case 'dropped':
-      return 'bad'
-    case 'cancelled':
-      return 'warn'
-  }
-}
-
-function formatTimestamp(value: string) {
-  const timestamp = new Date(value)
-  if (Number.isNaN(timestamp.getTime())) return value
-  return timestamp.toLocaleString()
-}
-
-function machineValue(value: string | undefined) {
-  return value ?? '—'
-}
 
 function mergeLedgerRows(rows: readonly LogRequest[]) {
   const locations = new Map<string, number>()
@@ -106,8 +82,7 @@ function filterSelections(search: LogsLedgerSearch): Record<LedgerFilterKey, Set
 
 function activeFilterGroupCount(search: LogsLedgerSearch) {
   return [
-    search.from,
-    search.to,
+    search.timeRange,
     search.model,
     search.provider,
     search.engine,
@@ -145,6 +120,10 @@ function liveStateTone(state: LogsLiveConnectionState): StatusBadgeTone {
   }
 }
 
+function getLogRequestRowId(row: LogRequest) {
+  return row.requestId.toString()
+}
+
 export function LogsLedger({ search, onSearchChange, onRequestOpen, onMaintenanceMutationSucceeded }: LogsLedgerProps) {
   const query = useLogsLedgerQuery(search)
   const { refetch } = query
@@ -152,6 +131,7 @@ export function LogsLedger({ search, onSearchChange, onRequestOpen, onMaintenanc
   const hydrate = useCallback(async () => refetch(), [refetch])
   const live = useLogsLiveRecovery({ enabled: result?.state === 'supported', search, hydrate })
   const rows = useMemo(() => (result?.state === 'supported' ? mergeLedgerRows(result.value.items) : []), [result])
+  const columns = useMemo(() => buildLogsLedgerColumns({ onRequestOpen, search }), [onRequestOpen, search])
   const optionsByCategory = useMemo<Record<LedgerFilterKey, FilterValueOption[]>>(
     () => ({
       model: filterOptions(rows, 'model'),
@@ -165,8 +145,6 @@ export function LogsLedger({ search, onSearchChange, onRequestOpen, onMaintenanc
   )
   const selectedValuesByCategory = useMemo(() => filterSelections(search), [search])
   const activeFilterGroups = activeFilterGroupCount(search)
-  const nextCursor = result?.state === 'supported' ? result.value.nextCursor?.toString() : undefined
-  const canGoBack = Boolean(search.cursor || search.trail?.length)
 
   useEffect(() => {
     if (!search.focusRequestId) return
@@ -190,14 +168,9 @@ export function LogsLedger({ search, onSearchChange, onRequestOpen, onMaintenanc
           </p>
         </div>
         <div className="flex items-center gap-2" aria-live="polite">
-          {query.isFetching && result ? (
-            <StatusBadge tone="accent" dot size="caption">
-              Updating
-            </StatusBadge>
-          ) : null}
           {result?.state === 'supported' ? (
-            <StatusBadge dot size="caption" tone={liveStateTone(live.state)}>
-              {liveStateLabel(live.state)}
+            <StatusBadge dot size="caption" tone={query.isFetching ? 'accent' : liveStateTone(live.state)}>
+              {query.isFetching ? 'Updating' : liveStateLabel(live.state)}
             </StatusBadge>
           ) : null}
           {result?.state === 'supported' ? (
@@ -209,28 +182,20 @@ export function LogsLedger({ search, onSearchChange, onRequestOpen, onMaintenanc
       </header>
 
       <div className="panel-shell flex flex-wrap items-end gap-2 rounded-[var(--radius)] border border-border bg-panel px-[var(--panel-x)] py-[var(--panel-y)]">
-        <label className="grid min-w-[13rem] flex-1 gap-1 text-[length:var(--density-type-caption)] text-fg-dim">
-          <span className="type-label text-fg-faint">From</span>
-          <Input
-            aria-label="Filter logs from time"
-            className="h-8 border-border bg-panel-strong font-mono text-[length:var(--density-type-caption)]"
-            onChange={(event) =>
-              onSearchChange(updateLogsFilter(search, 'from', event.currentTarget.value || undefined))
-            }
-            placeholder="RFC 3339 timestamp"
-            value={optionalFilterValue(search.from)}
+        <div className="grid min-w-[13rem] flex-1 gap-1 text-[length:var(--density-type-caption)] text-fg-dim">
+          <span className="type-label text-fg-faint">Time range</span>
+          <NativeSelect
+            ariaLabel="Filter logs by time range"
+            className="min-w-[13rem] flex-1"
+            name="logs-time-range"
+            onValueChange={(value) => {
+              const preset = RELATIVE_TIME_PRESETS.find((option) => option.value === value)
+              if (preset) onSearchChange(updateLogsTimeRange(search, preset.value))
+            }}
+            options={RELATIVE_TIME_PRESETS}
+            value={search.timeRange ?? ''}
           />
-        </label>
-        <label className="grid min-w-[13rem] flex-1 gap-1 text-[length:var(--density-type-caption)] text-fg-dim">
-          <span className="type-label text-fg-faint">To</span>
-          <Input
-            aria-label="Filter logs to time"
-            className="h-8 border-border bg-panel-strong font-mono text-[length:var(--density-type-caption)]"
-            onChange={(event) => onSearchChange(updateLogsFilter(search, 'to', event.currentTarget.value || undefined))}
-            placeholder="RFC 3339 timestamp"
-            value={optionalFilterValue(search.to)}
-          />
-        </label>
+        </div>
         <FilterPopover
           activeFilterGroups={activeFilterGroups}
           categories={ledgerFilterCategories}
@@ -277,19 +242,23 @@ export function LogsLedger({ search, onSearchChange, onRequestOpen, onMaintenanc
       ) : null}
 
       {query.isError ? (
-        <div
-          className="panel-shell flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius)] border border-[color:color-mix(in_oklab,var(--color-bad)_35%,var(--color-border))] bg-panel p-[var(--panel-x)]"
-          role="alert"
+        <Alert
+          className="panel-shell rounded-[var(--radius)] border border-[color:color-mix(in_oklab,var(--color-bad)_35%,var(--color-border))] bg-panel p-[var(--panel-x)]"
+          variant="destructive"
         >
-          <div>
-            <div className="type-panel-title text-foreground">Log history could not be loaded</div>
-            <p className="type-caption mt-1 text-fg-dim">The local logging service did not return a usable response.</p>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <AlertTitle className="type-panel-title text-foreground">Log history could not be loaded</AlertTitle>
+              <AlertDescription className="type-caption mt-1 text-fg-dim">
+                The local logging service did not return a usable response.
+              </AlertDescription>
+            </div>
+            <Button className="ui-control gap-1.5" onClick={() => void query.refetch()} size="sm" variant="outline">
+              <RefreshCw className="size-3.5" aria-hidden="true" />
+              Retry
+            </Button>
           </div>
-          <Button className="ui-control gap-1.5" onClick={() => void query.refetch()} size="sm" variant="outline">
-            <RefreshCw className="size-3.5" aria-hidden="true" />
-            Retry
-          </Button>
-        </div>
+        </Alert>
       ) : null}
 
       {result?.state === 'unsupported' ? (
@@ -316,80 +285,26 @@ export function LogsLedger({ search, onSearchChange, onRequestOpen, onMaintenanc
 
       {result?.state === 'supported' && rows.length > 0 ? (
         <div className="panel-shell overflow-hidden rounded-[var(--radius)] border border-border bg-panel">
-          <Table aria-label="Request logs" className="min-w-[780px] text-[length:var(--density-type-caption)]">
-            <TableHeader className="bg-panel-strong">
-              <TableRow className="border-border-soft hover:bg-panel-strong">
-                <TableHead className="type-label h-9 px-3 text-fg-faint">Occurred</TableHead>
-                <TableHead className="type-label h-9 px-3 text-fg-faint">Request</TableHead>
-                <TableHead className="type-label h-9 px-3 text-fg-faint">Model / route</TableHead>
-                <TableHead className="type-label h-9 px-3 text-fg-faint">Provider / engine</TableHead>
-                <TableHead className="type-label h-9 px-3 text-fg-faint">Outcome</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {rows.map((row) => (
-                <TableRow className="border-border-soft hover:bg-panel-strong" key={row.requestId.toString()}>
-                  <TableCell className="px-3 py-2 font-mono tabular-nums text-fg-dim">
-                    {formatTimestamp(row.createdAt)}
-                  </TableCell>
-                  <TableCell className="px-3 py-2 font-mono text-fg-dim">
-                    <button
-                      aria-label={`Open request ${row.requestId.toString()}`}
-                      className="break-all text-accent underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                      id={`log-request-${row.requestId.toString()}`}
-                      onClick={() =>
-                        onRequestOpen(row.requestId.toString(), { ...search, focusRequestId: row.requestId.toString() })
-                      }
-                      type="button"
-                    >
-                      {row.requestId.toString()}
-                    </button>
-                  </TableCell>
-                  <TableCell className="px-3 py-2">
-                    <div className="font-mono text-foreground">{machineValue(row.model)}</div>
-                    <div className="mt-0.5 font-mono text-fg-faint">{machineValue(row.route)}</div>
-                  </TableCell>
-                  <TableCell className="px-3 py-2">
-                    <div className="font-mono text-fg-dim">{machineValue(row.provider)}</div>
-                    <div className="mt-0.5 font-mono text-fg-faint">{machineValue(row.engine)}</div>
-                  </TableCell>
-                  <TableCell className="px-3 py-2">
-                    <div className="flex items-center gap-2">
-                      <StatusBadge dot size="caption" tone={requestTone(row.outcome)}>
-                        {row.outcome}
-                      </StatusBadge>
-                      <span className="font-mono text-fg-faint">{row.source}</span>
-                    </div>
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-          <div className="flex items-center justify-between gap-3 border-t border-border-soft px-[var(--panel-x)] py-[var(--panel-y)]">
-            <span className="type-caption text-fg-faint">
-              Rows keep their current order while active records refresh.
-            </span>
-            <div className="flex items-center gap-2">
-              <Button
-                className="ui-control h-8 rounded-[var(--radius)] px-2.5 text-[length:var(--density-type-caption)]"
-                disabled={!canGoBack}
-                onClick={() => onSearchChange(advanceLogsPage(search, undefined))}
-                size="sm"
-                variant="outline"
-              >
-                Previous
-              </Button>
-              <Button
-                className="ui-control h-8 rounded-[var(--radius)] px-2.5 text-[length:var(--density-type-caption)]"
-                disabled={!nextCursor}
-                onClick={() => onSearchChange(advanceLogsPage(search, nextCursor))}
-                size="sm"
-                variant="outline"
-              >
-                Next
-              </Button>
-            </div>
-          </div>
+          <ScrollArea className="max-h-[71rem]">
+            <DataTable
+              ariaLabel="Request logs"
+              columns={columns}
+              data={rows}
+              defaultPageSize={20}
+              emptyMessage="No log requests match this view."
+              enablePagination
+              filterColumnId="requestId"
+              filterPlaceholder="Filter by request ID"
+              getRowId={getLogRequestRowId}
+              tableClassName="min-w-[780px] text-[length:var(--density-type-caption)]"
+            >
+              {(table) => (
+                <div className="flex items-center justify-end px-[var(--panel-x)] py-2">
+                  <DataTableViewOptions table={table} />
+                </div>
+              )}
+            </DataTable>
+          </ScrollArea>
         </div>
       ) : null}
     </section>

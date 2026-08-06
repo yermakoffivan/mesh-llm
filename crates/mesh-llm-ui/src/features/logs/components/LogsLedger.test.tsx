@@ -65,7 +65,7 @@ describe('LogsLedger', () => {
     )
   })
 
-  it('keeps an active row in place when it supersedes durable history and shows stable cursor controls', async () => {
+  it('keeps an active row in place when it supersedes durable history and renders stable table pagination', async () => {
     const user = userEvent.setup()
     const onSearchChange = vi.fn()
     const onRequestOpen = vi.fn()
@@ -75,10 +75,10 @@ describe('LogsLedger', () => {
 
     expect(screen.getAllByText(REQUEST_A)).toHaveLength(1)
     expect(screen.getAllByText('active')).toHaveLength(2)
-    expect(screen.getByRole('button', { name: 'Previous' })).toBeDisabled()
+    expect(screen.getByRole('combobox', { name: 'Rows per page' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Go to previous page' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Go to next page' })).toBeDisabled()
 
-    await user.click(screen.getByRole('button', { name: 'Next' }))
-    expect(onSearchChange).toHaveBeenCalledWith(expect.objectContaining({ cursor: 'next-page', trail: [] }))
     await user.click(screen.getByRole('button', { name: `Open request ${REQUEST_A}` }))
     expect(onRequestOpen).toHaveBeenCalledWith(REQUEST_A, expect.objectContaining({ focusRequestId: REQUEST_A }))
   })
@@ -98,14 +98,29 @@ describe('LogsLedger', () => {
     expect(onSearchChange).toHaveBeenCalledWith({})
   })
 
-  it('keeps filter controls in the keyboard order and labels each time boundary', async () => {
+  it('keeps filter controls in the keyboard order and labels the time range control', async () => {
     const user = userEvent.setup()
     render(<LogsLedger onRequestOpen={vi.fn()} search={parseLogsLedgerSearch({})} onSearchChange={vi.fn()} />)
 
     await user.tab()
-    expect(screen.getByLabelText('Filter logs from time')).toHaveFocus()
-    await user.tab()
-    expect(screen.getByLabelText('Filter logs to time')).toHaveFocus()
+    expect(screen.getByLabelText('Filter logs by time range')).toHaveFocus()
+  })
+
+  it('filters the loaded page by request ID', async () => {
+    const user = userEvent.setup()
+    const REQUEST_B = '00000000-0000-4000-8000-000000000002'
+    queryState.current = supported([
+      request(REQUEST_A, 'completed', 'durable'),
+      request(REQUEST_B, 'failed', 'durable')
+    ])
+    render(<LogsLedger onRequestOpen={vi.fn()} search={parseLogsLedgerSearch({})} onSearchChange={vi.fn()} />)
+
+    expect(screen.getAllByRole('button', { name: /Open request/ })).toHaveLength(2)
+
+    await user.type(screen.getByLabelText('Filter by request ID'), REQUEST_A)
+
+    expect(screen.getByRole('button', { name: `Open request ${REQUEST_A}` })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: `Open request ${REQUEST_B}` })).not.toBeInTheDocument()
   })
 
   it('restores focus to the opened request after returning from the inspector', () => {

@@ -12,6 +12,7 @@ import {
 } from '@/components/ui/SharedModal'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Separator } from '@/components/ui/separator'
 import { LogsApiClient, type LogCleanupPreviewRequest, type LogsRequestQuery } from '@/features/logs/api/client'
 import { LogOperationId, LogWebhookDeliveryId, type LogRequestId } from '@/features/logs/api/ids'
 import type { LogCleanupOutcome, LogCleanupReceipt, LogDeleteReceipt, LogExport } from '@/features/logs/api/schemas'
@@ -558,18 +559,20 @@ export function LogRequestDeleteControl({ requestId, onMaintenanceMutationSuccee
   }
 
   return (
-    <div className="mt-5 border-t border-border-soft pt-3">
-      <Button
-        ref={triggerRef}
-        className="ui-control-destructive"
-        onClick={() => setOpen(true)}
-        size="sm"
-        type="button"
-        variant="outline"
-      >
-        <Trash2 className="size-3.5" aria-hidden="true" />
-        Delete terminal request
-      </Button>
+    <div className="mt-5">
+      <Separator />
+      <div className="pt-3">
+        <Button
+          ref={triggerRef}
+          className="ui-control-destructive"
+          onClick={() => setOpen(true)}
+          size="sm"
+          type="button"
+          variant="outline"
+        >
+          <Trash2 className="size-3.5" aria-hidden="true" />
+          Delete terminal request
+        </Button>
       <SharedModal open={open} onOpenChange={setOpen}>
         <SharedModalContent
           onCloseAutoFocus={(event) => {
@@ -642,6 +645,7 @@ export function LogRequestDeleteControl({ requestId, onMaintenanceMutationSuccee
           </SharedModalActionStrip>
         </SharedModalContent>
       </SharedModal>
+      </div>
     </div>
   )
 }
@@ -649,8 +653,10 @@ export function LogRequestDeleteControl({ requestId, onMaintenanceMutationSuccee
 export function LogOperations({ query, onMaintenanceMutationSucceeded }: LogOperationsProps) {
   const [exportOpen, setExportOpen] = useState(false)
   const [cleanupOpen, setCleanupOpen] = useState(false)
+  const [retryOpen, setRetryOpen] = useState(false)
   const exportButtonRef = useRef<HTMLButtonElement | null>(null)
   const cleanupButtonRef = useRef<HTMLButtonElement | null>(null)
+  const retryButtonRef = useRef<HTMLButtonElement | null>(null)
 
   return (
     <section className="flex flex-wrap items-center gap-2" aria-label="Log operations">
@@ -686,9 +692,17 @@ export function LogOperations({ query, onMaintenanceMutationSucceeded }: LogOper
           Clear active source or outcome selection before cleaning durable records.
         </span>
       ) : null}
-      <div className="basis-full">
-        <LogWebhookDeadLetterRetry />
-      </div>
+      <Button
+        ref={retryButtonRef}
+        className="ui-control h-8 gap-1.5 rounded-[var(--radius)] px-2.5 text-[length:var(--density-type-caption)]"
+        onClick={() => setRetryOpen(true)}
+        size="sm"
+        type="button"
+        variant="outline"
+      >
+        <RotateCcw className="size-3.5" aria-hidden="true" />
+        Dead-letter retry
+      </Button>
       <ExportDialog open={exportOpen} onOpenChange={setExportOpen} query={query} returnFocusRef={exportButtonRef} />
       <CleanupDialog
         open={cleanupOpen}
@@ -697,6 +711,32 @@ export function LogOperations({ query, onMaintenanceMutationSucceeded }: LogOper
         query={query}
         returnFocusRef={cleanupButtonRef}
       />
+      <SharedModal open={retryOpen} onOpenChange={setRetryOpen}>
+        <SharedModalContent
+          onCloseAutoFocus={(event) => {
+            if (!retryButtonRef.current) return
+            event.preventDefault()
+            retryButtonRef.current.focus()
+          }}
+        >
+          <SharedModalHeader>
+            <SharedModalTitle>Retry dead-letter delivery</SharedModalTitle>
+            <SharedModalDescription>
+              Schedule a webhook delivery retry for a failed delivery record. The server records the audit reason.
+            </SharedModalDescription>
+          </SharedModalHeader>
+          <SharedModalBody>
+            <LogWebhookDeadLetterRetry />
+          </SharedModalBody>
+          <SharedModalActionStrip>
+            <DialogPrimitive.Close asChild>
+              <Button className="ui-control" size="sm" type="button" variant="outline">
+                Close
+              </Button>
+            </DialogPrimitive.Close>
+          </SharedModalActionStrip>
+        </SharedModalContent>
+      </SharedModal>
     </section>
   )
 }

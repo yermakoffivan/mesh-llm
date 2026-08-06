@@ -1,4 +1,16 @@
 import { env } from '@/lib/env'
+
+
+
+import type { DataMode } from '@/lib/data-mode'
+import { HARNESS_LOG_FIXTURES, generateLifecycleEvents, generateArtifacts, generateProxyAttempts } from '../lib/log-fixtures'
+
+ 
+ 
+
+
+
+
 import { LogArtifactId, LogOperationId, LogPageCursor, LogRequestId, LogWebhookDeliveryId } from './ids'
 import {
   LogsDtoError,
@@ -202,6 +214,30 @@ function safeMediaType(mediaKind: string | undefined) {
     : 'application/octet-stream'
 }
 
+const HARNESS_PAGE_SIZE = 15
+
+function filterHarnessRequests(items: readonly LogRequest[], query: LogsRequestQuery): readonly LogRequest[] {
+  return items.filter((item) => {
+    if (query.from && item.createdAt < query.from) return false
+    if (query.to && item.createdAt > query.to) return false
+    if (query.route && item.route !== query.route) return false
+    if (query.model && item.model !== query.model) return false
+    if (query.provider && item.provider !== query.provider) return false
+    if (query.engine && item.engine !== query.engine) return false
+    if (query.status != null && item.statusCode !== query.status) return false
+    if (query.outcome && !item.outcome.includes(query.outcome)) return false
+    if (query.source && item.source !== query.source) return false
+    return true
+  })
+}
+
+function paginateHarnessRequests(items: readonly LogRequest[], cursor?: number, limit = HARNESS_PAGE_SIZE): LogsPage<LogRequest> {
+  const startIndex = Math.max(0, Number(cursor ?? 0))
+  const sliced = items.slice(startIndex, startIndex + limit)
+  const nextCursor = startIndex + sliced.length < items.length ? LogPageCursor.parse((startIndex + sliced.length).toString()) : undefined
+  return { items: sliced, nextCursor }
+}
+
 export class LogsApiClient {
   readonly #fetch: FetchFunction
 
@@ -209,7 +245,12 @@ export class LogsApiClient {
     this.#fetch = fetchFunction ?? fetch.bind(globalThis)
   }
 
-  async listRequests(query: LogsRequestQuery = {}): Promise<LogsCapability<LogsPage<LogRequest>>> {
+  async listRequests(query: LogsRequestQuery = {}, mode: DataMode = 'live'): Promise<LogsCapability<LogsPage<LogRequest>>> {
+    if (mode === 'harness') {
+      const filtered = filterHarnessRequests(HARNESS_LOG_FIXTURES, query)
+      const harnessCursor = query.cursor ? Number(query.cursor.toString()) : undefined
+      return { state: 'supported', value: paginateHarnessRequests(filtered, harnessCursor) }
+    }
     const response = await this.#fetch(endpoint(appendQuery('/api/logs/requests', serializeRequestQuery(query))))
     if (!response.ok) {
       const error = await responseError(response)
@@ -218,19 +259,31 @@ export class LogsApiClient {
     }
     return { state: 'supported', value: parseLogRequestPage(await responseJson(response)) }
   }
-
-  async getRequest(requestId: LogRequestId) {
+  async getRequest(requestId: LogRequestId, mode: DataMode = 'live'): Promise<LogRequest> {
+    if (mode === 'harness') {
+      const fixture = HARNESS_LOG_FIXTURES.find(f => f.requestId.toString() === requestId.toString())
+      if (!fixture) throw new LogsApiError(404, 'not_found')
+      return fixture as LogRequest
+    }
     return this.getJson(`/api/logs/requests/${encodeURIComponent(requestId.toString())}`, parseLogRequest)
   }
 
-  async listRequestEvents(requestId: LogRequestId, query: LogsPageQuery = {}) {
+  async listRequestEvents(requestId: LogRequestId, query: LogsPageQuery = {}, mode: DataMode = 'live') {
+    if (mode === 'harness') {
+      const events = generateLifecycleEvents(requestId.toString())
+      return { items: events as unknown[], nextCursor: undefined }
+    }
     return this.getJson(
       appendQuery(`/api/logs/requests/${encodeURIComponent(requestId.toString())}/events`, serializePageQuery(query)),
       parseLogLifecycleEventPage
     )
   }
 
-  async listRequestArtifacts(requestId: LogRequestId, query: LogsPageQuery = {}) {
+  async listRequestArtifacts(requestId: LogRequestId, query: LogsPageQuery = {}, mode: DataMode = 'live') {
+    if (mode === 'harness') {
+      const artifacts = generateArtifacts(requestId.toString())
+      return { items: artifacts as unknown[], nextCursor: undefined }
+    }
     return this.getJson(
       appendQuery(
         `/api/logs/requests/${encodeURIComponent(requestId.toString())}/artifacts`,
@@ -239,12 +292,14 @@ export class LogsApiClient {
       parseLogArtifactPage
     )
   }
-
   async getArtifact(artifactId: LogArtifactId) {
     return this.getJson(`/api/logs/artifacts/${encodeURIComponent(artifactId.toString())}`, parseLogArtifact)
   }
-
-  async listProxy(query: LogsProxyQuery = {}) {
+  async listProxy(query: LogsProxyQuery = {}, mode: DataMode = 'live') {
+    if (mode === 'harness' && query.requestId) {
+      const attempts = generateProxyAttempts(query.requestId.toString())
+      return { items: attempts as unknown[], nextCursor: undefined }
+    }
     const params = new URLSearchParams(serializePageQuery(query))
     setQueryValue(params, 'request_id', query.requestId?.toString())
     setQueryValue(params, 'provider', query.provider)
@@ -252,11 +307,9 @@ export class LogsApiClient {
     setQueryValue(params, 'status', query.status)
     return this.getJson(appendQuery('/api/logs/proxy', params.toString()), parseLogProxyPage)
   }
-
   logsEventSourceUrl(subscription: LogsSseSubscription) {
     return endpoint(appendQuery('/api/logs/events', serializeLogsSseSubscription(subscription)))
   }
-
   async downloadArtifact(artifactId: LogArtifactId): Promise<LogArtifactDownloadResult> {
     const artifact = await this.getArtifact(artifactId)
     if (artifact.contentState !== 'available' || artifact.contentBase64 === undefined) {

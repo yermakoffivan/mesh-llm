@@ -384,6 +384,7 @@ describe('LogOperations', () => {
   it('provides a typed manual retry control without inventing webhook history or authorization', async () => {
     const user = userEvent.setup()
     render(<LogOperations query={{}} />)
+    await user.click(screen.getByRole('button', { name: 'Dead-letter retry' }))
     expect(screen.getByLabelText('Webhook delivery ID')).toHaveValue('')
     expect(screen.getByRole('button', { name: 'Retry dead-letter delivery' })).toBeDisabled()
 

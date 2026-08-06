@@ -59,8 +59,8 @@ const tabs: {
 }[] = [
   { value: 'network', href: '/', labelKey: 'tabs.network' },
   { value: 'reserves', href: '/reserves', labelKey: 'tabs.reserves' },
-  { value: 'logs', href: '/logs', labelKey: 'tabs.logs' },
   { value: 'chat', href: '/chat', labelKey: 'tabs.chat' },
+  { value: 'logs', href: '/logs', labelKey: 'tabs.logs' },
   { value: 'configuration', href: '/configuration', labelKey: 'tabs.configuration' }
 ]
 

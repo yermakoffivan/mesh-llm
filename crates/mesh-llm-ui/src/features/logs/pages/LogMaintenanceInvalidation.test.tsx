@@ -55,7 +55,8 @@ describe('log maintenance invalidation', () => {
   it('refetches the active ledger and leaves inactive pages stale from either maintenance surface', async () => {
     const user = userEvent.setup()
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-    const inactiveLedgerKey = logsKeys.ledger({ route: 'inactive' })
+    const inactiveLedgerKey = logsKeys.ledger({ route: 'inactive' }, 'live')
+
     const invalidateQueries = vi.spyOn(queryClient, 'invalidateQueries')
     queryClient.setQueryData(inactiveLedgerKey, { source: 'inactive' })
 

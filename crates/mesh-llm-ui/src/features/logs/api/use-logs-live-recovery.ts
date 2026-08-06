@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { LogsApiClient } from '@/features/logs/api/client'
 import { LogReplayCursor, type LogReplayChannel } from '@/features/logs/api/ids'
 import { parseLogsSseFrame, type LogsSseFilter } from '@/features/logs/api/sse'
+import { resolveRelativeTime, type RelativeTimePreset } from '@/features/logs/lib/log-search'
 import type { LogsLedgerSearch } from '@/features/logs/lib/log-search'
 
 const POLL_INTERVAL_MS = 5_000
@@ -55,9 +56,15 @@ function parseReplayCursor(value: string | undefined) {
   }
 }
 
+/** Resolve timeRange to raw from/to bounds for SSE filter scope. */
+function resolvedTimeBounds(timeRange: RelativeTimePreset | '' | undefined): { from?: string; to?: string } {
+  if (!timeRange) return {}
+  const result = resolveRelativeTime(timeRange as RelativeTimePreset)
+  return result ?? {}
+}
+
 function activeFilterScope(
-  from: string | undefined,
-  to: string | undefined,
+  timeBounds: { from?: string; to?: string },
   model: string | undefined,
   provider: string | undefined,
   engine: string | undefined,
@@ -66,8 +73,8 @@ function activeFilterScope(
   outcome: string | undefined
 ): string[] {
   const entries: Array<[string, string | undefined]> = [
-    ['from', from],
-    ['to', to],
+    ['from', timeBounds.from],
+    ['to', timeBounds.to],
     ['model', model],
     ['provider', provider],
     ['engine', engine],
@@ -79,8 +86,7 @@ function activeFilterScope(
 }
 
 function streamFilters(
-  from: string | undefined,
-  to: string | undefined,
+  timeBounds: { from?: string; to?: string },
   model: string | undefined,
   provider: string | undefined,
   engine: string | undefined,
@@ -88,8 +94,8 @@ function streamFilters(
   outcome: string | undefined
 ): LogsSseFilter[] {
   const entries: Array<[LogsSseFilter['key'], string | undefined]> = [
-    ['from', from],
-    ['to', to],
+    ['from', timeBounds.from],
+    ['to', timeBounds.to],
     ['model', model],
     ['provider', provider],
     ['engine', engine],
@@ -128,25 +134,19 @@ export function useLogsLiveRecovery({
   const hydratePendingRef = useRef(false)
   const latestCursorRef = useRef<LogReplayCursor | undefined>(undefined)
   const restoredCursorValueRef = useRef<string | undefined>(undefined)
+
+  /* Resolve timeRange → from/to bounds once; used for both filter scope and SSE subscription. */
+  const timeBounds = useMemo(() => resolvedTimeBounds(search.timeRange), [search.timeRange])
+
   const filterScope = useMemo(
-    () =>
-      activeFilterScope(
-        search.from,
-        search.to,
-        search.model,
-        search.provider,
-        search.engine,
-        search.route,
-        search.source,
-        search.outcome
-      ),
-    [search.engine, search.from, search.model, search.outcome, search.provider, search.route, search.source, search.to]
+    () => activeFilterScope(timeBounds, search.model, search.provider, search.engine, search.route, search.source, search.outcome),
+    [timeBounds.from ?? '', timeBounds.to ?? '', search.model ?? '', search.provider ?? '', search.engine ?? '', search.route ?? '', search.source ?? '']
   )
+
   const key = subscriptionKey(channels, filterScope, search.replayCursor)
   const subscriptionFilters = useMemo(
-    () =>
-      streamFilters(search.from, search.to, search.model, search.provider, search.engine, search.route, search.outcome),
-    [search.engine, search.from, search.model, search.outcome, search.provider, search.route, search.to]
+    () => streamFilters(timeBounds, search.model, search.provider, search.engine, search.route, search.outcome),
+    [timeBounds.from ?? '', timeBounds.to ?? '', search.model ?? '', search.provider ?? '', search.engine ?? '', search.route ?? '']
   )
 
   useEffect(() => {
