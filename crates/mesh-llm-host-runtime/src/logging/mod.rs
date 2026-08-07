@@ -56,7 +56,10 @@ pub use runtime_state::{
     ArtifactCaptureRequest, LoggingRuntimeApplyError, LoggingRuntimeHealth, LoggingRuntimeState,
 };
 pub use sequences::SequenceGenerators;
-pub use service::{Clock, LoggingService, PersistSink, ServiceConfig, SystemClock};
+pub use service::{
+    Clock, LoggingService, OperationalAuditRecord, OperationalAuditSeverity, PersistSink,
+    ServiceConfig, SystemClock,
+};
 pub(crate) use webhook_delivery::{
     RandomWebhookJitter, ReqwestWebhookTransport, SystemWebhookWorkerClock, WebhookDeliveryWorker,
     WebhookJitter, WebhookTransport, WebhookTransportError, WebhookWorkerClock,

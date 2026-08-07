@@ -10,6 +10,7 @@ use std::sync::{
 use super::cursor::{decode_cursor, encode_cursor};
 use super::error::LogStoreError;
 use super::migrations::{CURRENT_VERSION, apply_migrations};
+use super::repositories::{AuditEntryFilters, AuditEntrySeverity, AuditEntrySource};
 use super::repositories::{
     WebhookDeliveryErrorCode, WebhookDeliveryInsertOutcome, WebhookDeliveryRecord,
     WebhookDeliveryState, WebhookRetryOutcome,
@@ -1230,6 +1231,114 @@ fn audit_entry_insert_and_count() {
         .expect("another unique entry_id with same request_id is fine");
 
     assert_eq!(store.count_table("audit_entries").unwrap(), 5);
+}
+
+#[test]
+fn audit_entries_page_by_occurred_at_and_entry_id_without_detail_leakage() {
+    let (store, _, _tmp) = open_store();
+    let timestamp = "2025-06-15T12:00:00Z";
+    for entry_id in ["audit-0001", "audit-0003", "audit-0002"] {
+        store
+            .insert_audit_entry(
+                entry_id,
+                None,
+                timestamp,
+                "runtime",
+                "runtime_ready",
+                Some(r#"{"severity":"info","secret":"SENTINEL-AUDIT-SECRET"}"#),
+            )
+            .unwrap();
+    }
+
+    let first_page = store
+        .list_audit_entries(Some(2), None, AuditEntryFilters::default())
+        .unwrap();
+    assert_eq!(
+        first_page
+            .items
+            .iter()
+            .map(|entry| entry.entry_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["audit-0003", "audit-0002"]
+    );
+    assert_eq!(first_page.items[0].severity, Some(AuditEntrySeverity::Info));
+    assert!(
+        !format!("{:?}", first_page.items).contains("SENTINEL-AUDIT-SECRET"),
+        "detail_json must never cross the AuditEntryRow boundary"
+    );
+
+    let second_page = store
+        .list_audit_entries(
+            Some(2),
+            first_page.next_cursor.as_deref(),
+            AuditEntryFilters::default(),
+        )
+        .unwrap();
+    assert_eq!(second_page.items.len(), 1);
+    assert_eq!(second_page.items[0].entry_id, "audit-0001");
+    assert!(second_page.next_cursor.is_none());
+}
+
+#[test]
+fn audit_entry_query_rejects_malformed_cursor_and_out_of_range_limit() {
+    let (store, _, _tmp) = open_store();
+
+    let cursor_error = store
+        .list_audit_entries(Some(1), Some("not-a-cursor"), AuditEntryFilters::default())
+        .unwrap_err();
+    assert!(matches!(cursor_error, LogStoreError::CursorMalformed(_)));
+
+    for limit in [Some(0), Some(101)] {
+        let limit_error = store
+            .list_audit_entries(limit, None, AuditEntryFilters::default())
+            .unwrap_err();
+        assert!(matches!(limit_error, LogStoreError::InvalidQuery(_)));
+    }
+}
+
+#[test]
+fn audit_entry_query_handles_nullable_request_empty_page_and_allowlisted_filters() {
+    let (store, _, _tmp) = open_store();
+    let empty_page = store
+        .list_audit_entries(None, None, AuditEntryFilters::default())
+        .unwrap();
+    assert!(empty_page.items.is_empty());
+    assert!(empty_page.next_cursor.is_none());
+
+    store
+        .insert_audit_entry(
+            "audit-null-request",
+            None,
+            "2025-06-15T12:00:00Z",
+            "runtime",
+            "runtime_ready",
+            Some(r#"{"severity":"info"}"#),
+        )
+        .unwrap();
+    store
+        .insert_audit_entry(
+            "audit-mesh-warning",
+            None,
+            "2025-06-15T12:00:01Z",
+            "mesh",
+            "mesh_quic_inbound_failed",
+            Some(r#"{"severity":"warning"}"#),
+        )
+        .unwrap();
+
+    let page = store
+        .list_audit_entries(
+            None,
+            None,
+            AuditEntryFilters {
+                source: Some(AuditEntrySource::Mesh),
+                severity: Some(AuditEntrySeverity::Warning),
+            },
+        )
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].entry_id, "audit-mesh-warning");
+    assert!(page.items[0].request_id.is_none());
 }
 
 #[test]

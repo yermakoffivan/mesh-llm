@@ -11,7 +11,7 @@ use mesh_llm_events::logging::replay::ReplayChannel;
 use mesh_llm_log_store::{LogStore, LogStoreError};
 
 use super::registry::RequestSummaryEntry;
-use super::service::{PersistSink, validate_proxy_record};
+use super::service::{OperationalAuditRecord, PersistSink, validate_proxy_record};
 
 type TerminalWebhookEnqueueCallback =
     dyn Fn(&LogStore, &str, &str, &str, u32) -> Result<(), LogStoreError> + Send + Sync;
@@ -237,17 +237,24 @@ impl PersistSink for LogStoreSink {
         .await
     }
 
-    async fn persist_audit_entry(&self, level: String, message: String) -> Result<(), String> {
+    async fn persist_audit_entry(&self, record: OperationalAuditRecord) -> Result<(), String> {
         let entry_id = EventId::new().as_uuid().to_string();
         let occurred_at = self.store.now();
+        let detail_json = if let Some(detail_json) = record.detail_json() {
+            Some(detail_json.to_string())
+        } else {
+            record
+                .severity()
+                .map(|severity| serde_json::json!({ "severity": severity.as_str() }).to_string())
+        };
         self.run_blocking(move |store| {
             store.insert_audit_entry(
                 &entry_id,
                 None,
                 &occurred_at,
-                "logging-service",
-                &level,
-                Some(&message),
+                record.source(),
+                record.code(),
+                detail_json.as_deref(),
             )
         })
         .await

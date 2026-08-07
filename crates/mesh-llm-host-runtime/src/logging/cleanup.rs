@@ -15,7 +15,9 @@ use mesh_llm_log_store::{
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use super::{LoggingCleanupOutcome, LoggingService};
+use super::{
+    LoggingCleanupOutcome, LoggingService, OperationalAuditRecord, OperationalAuditSeverity,
+};
 
 const CLEANUP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const CLEANUP_COMPLETED_AUDIT: &str = "logging_cleanup_completed";
@@ -472,11 +474,19 @@ async fn run_cleanup_once_with_cancellation(
 
     let outcome = match result {
         Ok(Ok(deleted_count)) => {
-            service.write_operational_audit(CLEANUP_COMPLETED_AUDIT, CLEANUP_COMPLETED_AUDIT);
+            service.write_operational_audit(
+                OperationalAuditRecord::builder("logging_service", CLEANUP_COMPLETED_AUDIT)
+                    .severity(OperationalAuditSeverity::Info)
+                    .build(),
+            );
             CleanupOutcome::Completed { deleted_count }
         }
         Ok(Err(_)) | Err(_) => {
-            service.write_operational_audit(CLEANUP_FAILED_AUDIT, CLEANUP_FAILED_AUDIT);
+            service.write_operational_audit(
+                OperationalAuditRecord::builder("logging_service", CLEANUP_FAILED_AUDIT)
+                    .severity(OperationalAuditSeverity::Error)
+                    .build(),
+            );
             CleanupOutcome::Failed
         }
     };

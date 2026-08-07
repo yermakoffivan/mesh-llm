@@ -752,14 +752,13 @@ impl LoggingRuntimeState {
     /// for the calling runtime path.
     pub(crate) fn write_operational_audit(
         &self,
-        level: &'static str,
-        message: &'static str,
+        record: super::service::OperationalAuditRecord,
     ) -> bool {
         if self.retired.load(Ordering::Acquire) {
             return false;
         }
         self.service.as_ref().is_some_and(|service| {
-            service.is_startable() && service.write_operational_audit(level, message)
+            service.is_startable() && service.write_operational_audit(record)
         })
     }
 

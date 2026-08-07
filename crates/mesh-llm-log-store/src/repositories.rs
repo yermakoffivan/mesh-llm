@@ -3,7 +3,7 @@
 use crate::cursor::{decode_cursor, encode_cursor};
 use crate::error::LogStoreError;
 use crate::store::LogStore;
-use rusqlite::{OptionalExtension, Row, Transaction};
+use rusqlite::{OptionalExtension, Row, Transaction, types::Value};
 use std::collections::BTreeMap;
 
 /// A single retention pass never deletes more than this many terminal
@@ -14,6 +14,8 @@ const MAX_WEBHOOK_ATTEMPTS: u32 = 20;
 const MAX_WEBHOOK_IDENTIFIER_BYTES: usize = 128;
 const MAX_WEBHOOK_TIMESTAMP_BYTES: usize = 64;
 const CONFIGURED_WEBHOOK_TARGET: &str = "configured_webhook";
+pub const DEFAULT_AUDIT_ENTRY_LIMIT: usize = 50;
+pub const MAX_AUDIT_ENTRY_LIMIT: usize = 100;
 
 // ─── Row types returned by queries ──────────────────────
 
@@ -49,6 +51,115 @@ pub struct LifecycleEventRow {
     pub event_id: String,
     pub request_id: String,
     pub occurred_at: String,
+}
+
+/// Public, privacy-safe projection of a durable operational audit entry.
+///
+/// `detail_json` remains private to durable audit storage and is never part of
+/// this read model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditEntryRow {
+    pub entry_id: String,
+    pub request_id: Option<String>,
+    pub occurred_at: String,
+    pub source: String,
+    pub code: String,
+    pub severity: Option<AuditEntrySeverity>,
+}
+
+/// Finite source vocabulary accepted by durable audit queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditEntrySource {
+    LoggingService,
+    Runtime,
+    Mesh,
+    Cli,
+}
+
+impl AuditEntrySource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::LoggingService => "logging_service",
+            Self::Runtime => "runtime",
+            Self::Mesh => "mesh",
+            Self::Cli => "cli",
+        }
+    }
+}
+
+/// Finite severity vocabulary accepted by durable audit queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditEntrySeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+impl AuditEntrySeverity {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+
+    fn parse(value: Option<String>) -> Result<Option<Self>, LogStoreError> {
+        match value.as_deref() {
+            None => Ok(None),
+            Some("info") => Ok(Some(Self::Info)),
+            Some("warning") => Ok(Some(Self::Warning)),
+            Some("error") => Ok(Some(Self::Error)),
+            Some(_) => Err(LogStoreError::QueryFailed(
+                "audit entry severity is invalid".to_string(),
+            )),
+        }
+    }
+}
+
+/// Typed allowlisted filters for the operational audit read model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AuditEntryFilters {
+    pub source: Option<AuditEntrySource>,
+    pub severity: Option<AuditEntrySeverity>,
+}
+
+fn validate_audit_entry_limit(limit: Option<usize>) -> Result<usize, LogStoreError> {
+    let limit = limit.unwrap_or(DEFAULT_AUDIT_ENTRY_LIMIT);
+    if (1..=MAX_AUDIT_ENTRY_LIMIT).contains(&limit) {
+        Ok(limit)
+    } else {
+        Err(LogStoreError::InvalidQuery(format!(
+            "audit entry limit must be within 1..={MAX_AUDIT_ENTRY_LIMIT}"
+        )))
+    }
+}
+
+fn audit_entry_query_parts(
+    cursor: Option<&(String, String)>,
+    filters: AuditEntryFilters,
+) -> (String, Vec<Value>) {
+    let mut clauses = Vec::new();
+    let mut parameters = Vec::new();
+    if let Some((occurred_at, entry_id)) = cursor {
+        clauses.push("(occurred_at, entry_id) < (?, ?)".to_string());
+        parameters.push(Value::Text(occurred_at.clone()));
+        parameters.push(Value::Text(entry_id.clone()));
+    }
+    if let Some(source) = filters.source {
+        clauses.push("actor = ?".to_string());
+        parameters.push(Value::Text(source.as_str().to_string()));
+    }
+    if let Some(severity) = filters.severity {
+        clauses.push("CASE WHEN json_valid(detail_json) THEN json_extract(detail_json, '$.severity') END = ?".to_string());
+        parameters.push(Value::Text(severity.as_str().to_string()));
+    }
+    let where_clause = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", clauses.join(" AND "))
+    };
+    (where_clause, parameters)
 }
 
 /// Durable, privacy-safe state for one scoped terminal webhook delivery.
@@ -966,14 +1077,14 @@ impl LogStore {
         entry_id: &str,
         request_id: Option<&str>,
         occurred_at: &str,
-        actor: &str,
-        action: &str,
+        source: &str,
+        code: &str,
         detail_json: Option<&str>,
     ) -> Result<(), LogStoreError> {
         let conn = self.conn();
         match conn.execute(
             "INSERT INTO audit_entries (entry_id, request_id, occurred_at, actor, action, detail_json) VALUES (?, ?, ?, ?, ?, ?)",
-            rusqlite::params![entry_id, request_id, occurred_at, actor, action, detail_json],
+            rusqlite::params![entry_id, request_id, occurred_at, source, code, detail_json],
         ) {
             Ok(_) => Ok(()),
             Err(ref e) if is_unique_constraint_error(e) => Err(LogStoreError::AlreadyExists {
@@ -981,6 +1092,57 @@ impl LogStore {
             }),
             Err(e) => Err(LogStoreError::InsertFailed(e.to_string())),
         }
+    }
+
+    /// List privacy-safe operational audit rows with cursor pagination.
+    ///
+    /// The query mirrors lifecycle ordering on `(occurred_at, entry_id)` while
+    /// fetching one extra row to determine the next cursor. `detail_json` is
+    /// only used internally for the bounded severity projection.
+    pub fn list_audit_entries(
+        &self,
+        limit: Option<usize>,
+        after_cursor: Option<&str>,
+        filters: AuditEntryFilters,
+    ) -> Result<Page<AuditEntryRow>, LogStoreError> {
+        let limit = validate_audit_entry_limit(limit)?;
+        let cursor = after_cursor.map(decode_cursor).transpose()?;
+        let (where_clause, parameters) = audit_entry_query_parts(cursor.as_ref(), filters);
+        let sql = format!(
+            "SELECT entry_id, request_id, occurred_at, actor, action, \
+             CASE WHEN json_valid(detail_json) THEN json_extract(detail_json, '$.severity') END \
+             FROM audit_entries {where_clause} \
+             ORDER BY occurred_at DESC, entry_id DESC LIMIT {}",
+            limit + 1
+        );
+        let conn = self.conn();
+        let mut statement = conn.prepare(&sql).map_err(LogStoreError::Sqlite)?;
+        let mut items: Vec<AuditEntryRow> = statement
+            .query_map(rusqlite::params_from_iter(parameters), |row| {
+                Ok(AuditEntryRow {
+                    entry_id: row.get(0)?,
+                    request_id: row.get(1)?,
+                    occurred_at: row.get(2)?,
+                    source: row.get(3)?,
+                    code: row.get(4)?,
+                    severity: AuditEntrySeverity::parse(row.get(5)?).map_err(|error| {
+                        rusqlite::Error::ToSqlConversionFailure(Box::new(error))
+                    })?,
+                })
+            })
+            .map_err(LogStoreError::Sqlite)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| LogStoreError::QueryFailed(error.to_string()))?;
+
+        let has_more = items.len() > limit;
+        if has_more {
+            items.pop();
+        }
+        let next_cursor = has_more.then(|| {
+            let last = &items[items.len() - 1];
+            encode_cursor(&last.occurred_at, &last.entry_id)
+        });
+        Ok(Page { items, next_cursor })
     }
 
     // ════════════════════════════

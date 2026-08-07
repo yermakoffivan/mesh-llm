@@ -8,10 +8,24 @@
 
 #[cfg(test)]
 use crate::logging::LoggingService;
+use crate::logging::{OperationalAuditRecord, OperationalAuditSeverity};
 use mesh_llm_config::{ConfigDiagnostic, ConfigDiagnosticSeverity};
 
 const OPERATIONAL_AUDIT_INFO: &str = "info";
 const OPERATIONAL_AUDIT_WARNING: &str = "warning";
+
+const OPERATIONAL_AUDIT_SOURCE: &str = "runtime";
+
+fn operational_audit_record(code: &'static str, level: &'static str) -> OperationalAuditRecord {
+    let severity = match level {
+        OPERATIONAL_AUDIT_INFO => OperationalAuditSeverity::Info,
+        OPERATIONAL_AUDIT_WARNING => OperationalAuditSeverity::Warning,
+        _ => OperationalAuditSeverity::Error,
+    };
+    OperationalAuditRecord::builder(OPERATIONAL_AUDIT_SOURCE, code)
+        .severity(severity)
+        .build()
+}
 
 /// Static runtime and model lifecycle outcomes that are safe to publish locally.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -236,7 +250,7 @@ pub(crate) fn record_runtime_operational_event(event: RuntimeOperationalEvent) {
     let Some(state) = crate::logging_runtime_state() else {
         return;
     };
-    let _ = state.write_operational_audit(event.level(), event.code());
+    let _ = state.write_operational_audit(operational_audit_record(event.code(), event.level()));
 }
 
 /// Record a native Skippy lifecycle transition through the same bounded,
@@ -245,7 +259,7 @@ pub(crate) fn record_native_skippy_operational_event(event: NativeSkippyOperatio
     let Some(state) = crate::logging_runtime_state() else {
         return;
     };
-    let _ = state.write_operational_audit(event.level(), event.code());
+    let _ = state.write_operational_audit(operational_audit_record(event.code(), event.level()));
 }
 
 /// Record one configuration boundary result through the process-local logging
@@ -255,7 +269,7 @@ pub(crate) fn record_config_operational_event(event: ConfigOperationalEvent) {
     let Some(state) = crate::logging_runtime_state() else {
         return;
     };
-    let _ = state.write_operational_audit(event.level(), event.code());
+    let _ = state.write_operational_audit(operational_audit_record(event.code(), event.level()));
 }
 
 /// Record one discovery boundary result through the process-local logging
@@ -265,7 +279,7 @@ pub(crate) fn record_discovery_operational_event(event: DiscoveryOperationalEven
     let Some(state) = crate::logging_runtime_state() else {
         return;
     };
-    let _ = state.write_operational_audit(event.level(), event.code());
+    let _ = state.write_operational_audit(operational_audit_record(event.code(), event.level()));
 }
 
 /// Record one local-serving state transition through the process-local logging
@@ -275,7 +289,7 @@ pub(crate) fn record_local_serving_operational_event(event: LocalServingOperatio
     let Some(state) = crate::logging_runtime_state() else {
         return;
     };
-    let _ = state.write_operational_audit(event.level(), event.code());
+    let _ = state.write_operational_audit(operational_audit_record(event.code(), event.level()));
 }
 
 #[cfg(test)]
@@ -283,7 +297,7 @@ fn record_runtime_operational_event_with_service(
     service: &LoggingService,
     event: RuntimeOperationalEvent,
 ) {
-    let _ = service.write_operational_audit(event.level(), event.code());
+    let _ = service.write_operational_audit(operational_audit_record(event.code(), event.level()));
 }
 
 #[cfg(test)]
@@ -291,7 +305,7 @@ fn record_native_skippy_operational_event_with_service(
     service: &LoggingService,
     event: NativeSkippyOperationalEvent,
 ) {
-    let _ = service.write_operational_audit(event.level(), event.code());
+    let _ = service.write_operational_audit(operational_audit_record(event.code(), event.level()));
 }
 
 #[cfg(test)]
@@ -299,7 +313,7 @@ fn record_config_operational_event_with_service(
     service: &LoggingService,
     event: ConfigOperationalEvent,
 ) {
-    let _ = service.write_operational_audit(event.level(), event.code());
+    let _ = service.write_operational_audit(operational_audit_record(event.code(), event.level()));
 }
 
 #[cfg(test)]
@@ -307,7 +321,7 @@ fn record_discovery_operational_event_with_service(
     service: &LoggingService,
     event: DiscoveryOperationalEvent,
 ) {
-    let _ = service.write_operational_audit(event.level(), event.code());
+    let _ = service.write_operational_audit(operational_audit_record(event.code(), event.level()));
 }
 
 #[cfg(test)]
@@ -315,7 +329,7 @@ fn record_local_serving_operational_event_with_service(
     service: &LoggingService,
     event: LocalServingOperationalEvent,
 ) {
-    let _ = service.write_operational_audit(event.level(), event.code());
+    let _ = service.write_operational_audit(operational_audit_record(event.code(), event.level()));
 }
 
 #[cfg(test)]
@@ -339,7 +353,15 @@ mod tests {
             .bus_ref()
             .drain()
             .into_iter()
-            .map(|entry| serde_json::from_str(&entry.payload).expect("audit payload"))
+            .map(|entry| {
+                let audit: serde_json::Value =
+                    serde_json::from_str(&entry.payload).expect("audit payload");
+                serde_json::json!({
+                    "kind": "audit",
+                    "level": audit["severity"],
+                    "message": audit["code"],
+                })
+            })
             .collect()
     }
 

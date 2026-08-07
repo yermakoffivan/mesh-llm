@@ -62,7 +62,7 @@ async fn manual_sink_failure_enqueues_a_canonical_system_fallback_without_blocki
 
 #[tokio::test(flavor = "current_thread")]
 async fn log_store_sqlite_busy_seam_never_blocks_the_shared_tokio_executor() {
-    use crate::logging::LogStoreSink;
+    use crate::logging::{LogStoreSink, OperationalAuditRecord, OperationalAuditSeverity};
 
     let root = tempfile::tempdir().expect("temporary log-store root");
     let store = Arc::new(
@@ -91,8 +91,12 @@ async fn log_store_sqlite_busy_seam_never_blocks_the_shared_tokio_executor() {
     let write = {
         let sink = Arc::clone(&sink);
         tokio::spawn(async move {
-            sink.persist_audit_entry("error".into(), "busy seam".into())
-                .await
+            sink.persist_audit_entry(
+                OperationalAuditRecord::builder("logging_service", "busy_seam")
+                    .severity(OperationalAuditSeverity::Error)
+                    .build(),
+            )
+            .await
         })
     };
     tokio::task::spawn_blocking(move || started_rx.recv())

@@ -62,8 +62,8 @@ pub trait PersistSink: Send + Sync {
     /// Persist a proxy transport record.
     async fn persist_proxy_record(&self, proxy_json: String) -> Result<(), String>;
 
-    /// Persist an audit entry for operational events (config changes, errors).
-    async fn persist_audit_entry(&self, level: String, message: String) -> Result<(), String>;
+    /// Persist one typed static operational audit record.
+    async fn persist_audit_entry(&self, record: OperationalAuditRecord) -> Result<(), String>;
 
     /// Persist a webhook delivery record.
     async fn persist_webhook_delivery(
@@ -101,6 +101,91 @@ impl Default for SystemClock {
     }
 }
 
+/// Static, bounded operational audit data admitted by the logging service.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OperationalAuditRecord {
+    source: &'static str,
+    code: &'static str,
+    severity: Option<OperationalAuditSeverity>,
+    detail_json: Option<String>,
+}
+
+impl OperationalAuditRecord {
+    pub const fn builder(
+        source: &'static str,
+        code: &'static str,
+    ) -> OperationalAuditRecordBuilder {
+        OperationalAuditRecordBuilder {
+            source,
+            code,
+            severity: None,
+        }
+    }
+
+    pub const fn source(&self) -> &'static str {
+        self.source
+    }
+
+    pub const fn code(&self) -> &'static str {
+        self.code
+    }
+
+    pub const fn severity(&self) -> Option<OperationalAuditSeverity> {
+        self.severity
+    }
+
+    fn with_internal_detail(mut self, detail_json: String) -> Self {
+        self.detail_json = Some(detail_json);
+        self
+    }
+
+    pub(crate) fn detail_json(&self) -> Option<&str> {
+        self.detail_json.as_deref()
+    }
+}
+
+/// Builder for static operational audit records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperationalAuditRecordBuilder {
+    source: &'static str,
+    code: &'static str,
+    severity: Option<OperationalAuditSeverity>,
+}
+
+impl OperationalAuditRecordBuilder {
+    pub const fn severity(mut self, severity: OperationalAuditSeverity) -> Self {
+        self.severity = Some(severity);
+        self
+    }
+
+    pub const fn build(self) -> OperationalAuditRecord {
+        OperationalAuditRecord {
+            source: self.source,
+            code: self.code,
+            severity: self.severity,
+            detail_json: None,
+        }
+    }
+}
+
+/// Bounded severity vocabulary for operational audit records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperationalAuditSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+impl OperationalAuditSeverity {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+}
+
 /// Configuration for the logging service. Derived from [`mesh_llm_config::LoggingConfig`] but simplified for runtime use.
 #[derive(Clone, Debug)]
 pub struct ServiceConfig {
@@ -135,6 +220,7 @@ enum WorkerMessage {
 #[derive(Debug)]
 enum PersistenceEntry {
     Bus(BusEntry),
+    Audit(OperationalAuditRecord),
     ProxyRecord(String),
 }
 
@@ -336,12 +422,13 @@ impl EventDelivery {
             enqueue_event_with_delivery(self, request_id, channel, payload_json, summary_snapshots);
     }
 
-    fn enqueue_audit(&self, level: &'static str, message: &'static str) {
+    fn enqueue_audit(&self, record: OperationalAuditRecord) {
         let entry = BusEntry {
             payload: serde_json::json!({
                 "kind": "audit",
-                "level": level,
-                "message": message,
+                "source": record.source(),
+                "code": record.code(),
+                "severity": record.severity().map(OperationalAuditSeverity::as_str),
             })
             .to_string(),
             channel_hint: 2,
@@ -355,7 +442,7 @@ impl EventDelivery {
                 &self.persistence_queue_drops,
                 &self.persistence_outstanding,
                 &self.metrics,
-                PersistenceEntry::Bus(entry),
+                PersistenceEntry::Audit(record),
             );
         }
     }
@@ -987,6 +1074,7 @@ impl LoggingService {
     ) -> Result<(), String> {
         match entry {
             PersistenceEntry::Bus(entry) => Self::process_bus_entry(sink, entry).await,
+            PersistenceEntry::Audit(record) => sink.persist_audit_entry(record.clone()).await,
             PersistenceEntry::ProxyRecord(proxy_json) => {
                 sink.persist_proxy_record(proxy_json.clone()).await
             }
@@ -1009,17 +1097,7 @@ impl LoggingService {
         }
 
         if record.get("kind").and_then(serde_json::Value::as_str) == Some("audit") {
-            let action = record
-                .get("level")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "audit bus record has no action".to_string())?;
-            let message = record
-                .get("message")
-                .and_then(serde_json::Value::as_str)
-                .ok_or_else(|| "audit bus record has no message".to_string())?;
-            return sink
-                .persist_audit_entry(action.to_owned(), message.to_owned())
-                .await;
+            return Err("audit bus record reached lifecycle persistence path".to_string());
         }
 
         if let Some(envelope_value) = record
@@ -1031,10 +1109,12 @@ impl LoggingService {
             if let LifecycleEvent::AuditError { .. } = envelope.event {
                 return sink
                     .persist_audit_entry(
-                        "error".into(),
-                        serde_json::to_string(&envelope).map_err(|error| {
-                            format!("serialize canonical audit envelope: {error}")
-                        })?,
+                        OperationalAuditRecord::builder("logging_service", "audit_error")
+                            .severity(OperationalAuditSeverity::Error)
+                            .build()
+                            .with_internal_detail(serde_json::to_string(&envelope).map_err(
+                                |error| format!("serialize canonical audit envelope: {error}"),
+                            )?),
                     )
                     .await;
             }
@@ -1053,8 +1133,13 @@ impl LoggingService {
 
         // Entries which are not canonical lifecycle records are operational
         // audit records. They stay out of the lifecycle repositories.
-        sink.persist_audit_entry("info".into(), entry.payload.clone())
-            .await
+        sink.persist_audit_entry(
+            OperationalAuditRecord::builder("logging_service", "uncategorized_bus_record")
+                .severity(OperationalAuditSeverity::Info)
+                .build()
+                .with_internal_detail(entry.payload.clone()),
+        )
+        .await
     }
 
     /// Enqueue a lifecycle event for the given request. This is fail-open: if the bus is full, drop counters increment and Ok(()) returns — the caller should NOT block or retry. Returns `Ok(())` always (the writer absorbs failures).
@@ -1275,13 +1360,11 @@ impl LoggingService {
     }
 
     /// Write one bounded operational audit record through the same replay and
-    /// persistence hand-off as lifecycle records. Both fields are static
-    /// caller-controlled vocabulary, which keeps scheduler health reporting
-    /// path-free and recursion-safe.
-    pub fn write_operational_audit(&self, level: &'static str, message: &'static str) -> bool {
+    /// persistence hand-off as lifecycle records.
+    pub fn write_operational_audit(&self, record: OperationalAuditRecord) -> bool {
         let event_delivery = self.event_delivery();
         self.writer.try_record_error(move || {
-            event_delivery.enqueue_audit(level, message);
+            event_delivery.enqueue_audit(record);
         })
     }
 

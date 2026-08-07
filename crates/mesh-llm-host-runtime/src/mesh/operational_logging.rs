@@ -5,9 +5,23 @@
 
 #[cfg(test)]
 use crate::logging::LoggingService;
+use crate::logging::{OperationalAuditRecord, OperationalAuditSeverity};
 
 const OPERATIONAL_AUDIT_INFO: &str = "info";
 const OPERATIONAL_AUDIT_WARNING: &str = "warning";
+
+const OPERATIONAL_AUDIT_SOURCE: &str = "mesh";
+
+fn operational_audit_record(code: &'static str, level: &'static str) -> OperationalAuditRecord {
+    let severity = match level {
+        OPERATIONAL_AUDIT_INFO => OperationalAuditSeverity::Info,
+        OPERATIONAL_AUDIT_WARNING => OperationalAuditSeverity::Warning,
+        _ => OperationalAuditSeverity::Error,
+    };
+    OperationalAuditRecord::builder(OPERATIONAL_AUDIT_SOURCE, code)
+        .severity(severity)
+        .build()
+}
 
 /// Static outcomes that are safe to publish through the local operational log.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,7 +79,7 @@ pub(crate) fn record_mesh_operational_event(event: MeshOperationalEvent) {
     let Some(state) = crate::logging_runtime_state() else {
         return;
     };
-    let _ = state.write_operational_audit(event.level(), event.code());
+    let _ = state.write_operational_audit(operational_audit_record(event.code(), event.level()));
 }
 
 #[cfg(test)]
@@ -73,7 +87,7 @@ fn record_mesh_operational_event_with_service(
     service: &LoggingService,
     event: MeshOperationalEvent,
 ) {
-    let _ = service.write_operational_audit(event.level(), event.code());
+    let _ = service.write_operational_audit(operational_audit_record(event.code(), event.level()));
 }
 
 #[cfg(test)]
@@ -86,7 +100,15 @@ mod tests {
             .bus_ref()
             .drain()
             .into_iter()
-            .map(|entry| serde_json::from_str(&entry.payload).expect("audit payload"))
+            .map(|entry| {
+                let audit: serde_json::Value =
+                    serde_json::from_str(&entry.payload).expect("audit payload");
+                serde_json::json!({
+                    "kind": "audit",
+                    "level": audit["severity"],
+                    "message": audit["code"],
+                })
+            })
             .collect()
     }
 

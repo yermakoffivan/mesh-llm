@@ -82,7 +82,10 @@ impl PersistSink for TransportProxySink {
         Ok(())
     }
 
-    async fn persist_audit_entry(&self, _level: String, _message: String) -> Result<(), String> {
+    async fn persist_audit_entry(
+        &self,
+        _record: crate::logging::OperationalAuditRecord,
+    ) -> Result<(), String> {
         Ok(())
     }
 

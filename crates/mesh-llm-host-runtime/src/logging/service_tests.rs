@@ -3,7 +3,7 @@
 use crate::logging::{
     BusEntry, Clock, FailOpenWriter, PersistSink, RegistryConfig, TerminalOutcome,
 };
-use crate::logging::{ReplayBus, RequestRegistry, RequestSummaryEntry};
+use crate::logging::{OperationalAuditRecord, ReplayBus, RequestRegistry, RequestSummaryEntry};
 use mesh_llm_events::logging::events::LifecycleEvent;
 use mesh_llm_events::logging::identifiers::{AttemptId, EventId, RequestId};
 use mesh_llm_events::logging::proxy::ProxyRecord;
@@ -184,7 +184,7 @@ impl PersistSink for TestSink {
         Ok(())
     }
 
-    async fn persist_audit_entry(&self, level: String, message: String) -> Result<(), String> {
+    async fn persist_audit_entry(&self, record: OperationalAuditRecord) -> Result<(), String> {
         if let Some(tx) = &self.audit_attempt_notifications {
             let _ = tx.send(());
         }
@@ -192,12 +192,27 @@ impl PersistSink for TestSink {
             return Err("sink failing".into());
         }
         if let Some(tx) = &self.audit_notifications {
-            let _ = tx.send((level.clone(), message.clone()));
+            let _ = tx.send((
+                record
+                    .severity()
+                    .map_or("none", crate::logging::OperationalAuditSeverity::as_str)
+                    .to_string(),
+                record
+                    .detail_json()
+                    .unwrap_or_else(|| record.code())
+                    .to_string(),
+            ));
         }
-        self.records
-            .lock()
-            .unwrap()
-            .push(TestRecord::AuditEntry { level, message });
+        self.records.lock().unwrap().push(TestRecord::AuditEntry {
+            level: record
+                .severity()
+                .map_or("none", crate::logging::OperationalAuditSeverity::as_str)
+                .to_string(),
+            message: record
+                .detail_json()
+                .unwrap_or_else(|| record.code())
+                .to_string(),
+        });
         Ok(())
     }
 
@@ -297,12 +312,17 @@ impl PersistSink for BlockingAuditSink {
         Ok(())
     }
 
-    async fn persist_audit_entry(&self, _level: String, message: String) -> Result<(), String> {
+    async fn persist_audit_entry(&self, record: OperationalAuditRecord) -> Result<(), String> {
         if self.first_write.swap(false, AtomicOrdering::AcqRel) {
             let _ = self.started.send(());
             self.release.notified().await;
         }
-        let _ = self.completed.send(message);
+        let _ = self.completed.send(
+            record
+                .detail_json()
+                .unwrap_or_else(|| record.code())
+                .to_string(),
+        );
         Ok(())
     }
 
