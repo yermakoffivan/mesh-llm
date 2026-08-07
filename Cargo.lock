@@ -3681,6 +3681,7 @@ dependencies = [
  "mesh-llm-cli",
  "mesh-llm-client",
  "mesh-llm-commands",
+ "mesh-llm-events",
  "mesh-llm-host-runtime",
  "mesh-llm-plugin",
  "mesh-llm-plugin-manager",

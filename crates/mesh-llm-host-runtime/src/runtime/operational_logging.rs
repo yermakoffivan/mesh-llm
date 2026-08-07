@@ -337,10 +337,12 @@ mod tests {
     use super::{
         ConfigDiagnosticsOutcome, ConfigOperationalEvent, DiscoveryOperationalEvent,
         LocalServingOperationalEvent, NativeSkippyOperationalEvent, RuntimeOperationalEvent,
-        record_config_operational_event_with_service,
-        record_discovery_operational_event_with_service,
+        record_config_operational_event, record_config_operational_event_with_service,
+        record_discovery_operational_event, record_discovery_operational_event_with_service,
+        record_local_serving_operational_event,
         record_local_serving_operational_event_with_service,
-        record_native_skippy_operational_event_with_service,
+        record_native_skippy_operational_event,
+        record_native_skippy_operational_event_with_service, record_runtime_operational_event,
         record_runtime_operational_event_with_service,
     };
     use crate::logging::{LoggingService, ServiceConfig};
@@ -872,6 +874,301 @@ mod tests {
                 "audit code must be a static identifier: {code}"
             );
             assert!(matches!(level, "info" | "warning"));
+        }
+    }
+
+    #[test]
+    fn native_skippy_operational_vocabulary_is_bounded_and_identifier_only() {
+        let events = [
+            NativeSkippyOperationalEvent::RuntimeStartupStarted,
+            NativeSkippyOperationalEvent::RuntimeReady,
+            NativeSkippyOperationalEvent::RuntimeStartupFailed,
+            NativeSkippyOperationalEvent::RuntimeShutdownStarted,
+            NativeSkippyOperationalEvent::ModelOpenStarted,
+            NativeSkippyOperationalEvent::ModelOpenFinished,
+            NativeSkippyOperationalEvent::ModelOpenFailed,
+        ];
+
+        for event in events {
+            let code = event.code();
+            assert!(code.len() <= 48, "audit code must stay bounded: {code}");
+            assert!(
+                code.bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+                "audit code must be a static identifier: {code}"
+            );
+            assert!(matches!(event.level(), "info" | "warning"));
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn runtime_boundary_producers_are_fail_open_without_startable_logging() {
+        crate::initialize_logging_foundation(&mesh_llm_config::LoggingConfig {
+            enabled: false,
+            ..Default::default()
+        })
+        .await;
+        record_runtime_operational_event(RuntimeOperationalEvent::StartupFailed);
+        record_native_skippy_operational_event(NativeSkippyOperationalEvent::ModelOpenFailed);
+        record_config_operational_event(ConfigOperationalEvent::ApplyRejected);
+        record_discovery_operational_event(DiscoveryOperationalEvent::JoinFailed);
+        record_local_serving_operational_event(LocalServingOperationalEvent::Unavailable);
+    }
+
+    #[test]
+    fn every_runtime_operational_event_emits_exactly_its_allowed_code() {
+        let cases = [
+            (
+                RuntimeOperationalEvent::StartupStarted,
+                "info",
+                "runtime_startup_started",
+            ),
+            (
+                RuntimeOperationalEvent::StartupFailed,
+                "warning",
+                "runtime_startup_failed",
+            ),
+            (RuntimeOperationalEvent::Ready, "info", "runtime_ready"),
+            (
+                RuntimeOperationalEvent::ShutdownStarted,
+                "info",
+                "runtime_shutdown_started",
+            ),
+            (
+                RuntimeOperationalEvent::ModelLoadStarted,
+                "info",
+                "runtime_model_load_started",
+            ),
+            (
+                RuntimeOperationalEvent::ModelReady,
+                "info",
+                "runtime_model_ready",
+            ),
+            (
+                RuntimeOperationalEvent::ModelLoadFailed,
+                "warning",
+                "runtime_model_load_failed",
+            ),
+            (
+                RuntimeOperationalEvent::ModelUnloaded,
+                "info",
+                "runtime_model_unloaded",
+            ),
+        ];
+
+        for (event, level, code) in cases {
+            let service = LoggingService::new_disabled(ServiceConfig::default());
+            record_runtime_operational_event_with_service(&service, event);
+            assert_eq!(
+                recorded_audits(&service),
+                vec![serde_json::json!({
+                    "kind": "audit",
+                    "level": level,
+                    "message": code,
+                })],
+                "runtime hook {event:?} must emit exactly one {code} audit"
+            );
+        }
+    }
+
+    #[test]
+    fn every_native_skippy_operational_event_emits_exactly_its_allowed_code() {
+        let cases = [
+            (
+                NativeSkippyOperationalEvent::RuntimeStartupStarted,
+                "info",
+                "skippy_native_runtime_startup_started",
+            ),
+            (
+                NativeSkippyOperationalEvent::RuntimeReady,
+                "info",
+                "skippy_native_runtime_ready",
+            ),
+            (
+                NativeSkippyOperationalEvent::RuntimeStartupFailed,
+                "warning",
+                "skippy_native_runtime_startup_failed",
+            ),
+            (
+                NativeSkippyOperationalEvent::RuntimeShutdownStarted,
+                "info",
+                "skippy_native_runtime_shutdown_started",
+            ),
+            (
+                NativeSkippyOperationalEvent::ModelOpenStarted,
+                "info",
+                "skippy_native_model_open_started",
+            ),
+            (
+                NativeSkippyOperationalEvent::ModelOpenFinished,
+                "info",
+                "skippy_native_model_open_finished",
+            ),
+            (
+                NativeSkippyOperationalEvent::ModelOpenFailed,
+                "warning",
+                "skippy_native_model_open_failed",
+            ),
+        ];
+
+        for (event, level, code) in cases {
+            let service = LoggingService::new_disabled(ServiceConfig::default());
+            record_native_skippy_operational_event_with_service(&service, event);
+            assert_eq!(
+                recorded_audits(&service),
+                vec![serde_json::json!({
+                    "kind": "audit",
+                    "level": level,
+                    "message": code,
+                })],
+                "native hook {event:?} must emit exactly one {code} audit"
+            );
+        }
+    }
+
+    #[test]
+    fn every_config_operational_event_emits_exactly_its_allowed_code() {
+        let cases = [
+            (
+                ConfigOperationalEvent::ApplyStarted,
+                "info",
+                "runtime_config_apply_started",
+            ),
+            (
+                ConfigOperationalEvent::ApplyAccepted,
+                "info",
+                "runtime_config_apply_accepted",
+            ),
+            (
+                ConfigOperationalEvent::ApplyRejected,
+                "warning",
+                "runtime_config_apply_rejected",
+            ),
+            (
+                ConfigOperationalEvent::Diagnostics(ConfigDiagnosticsOutcome::Clean),
+                "info",
+                "runtime_config_diagnostics_clean",
+            ),
+            (
+                ConfigOperationalEvent::Diagnostics(ConfigDiagnosticsOutcome::Info),
+                "info",
+                "runtime_config_diagnostics_info",
+            ),
+            (
+                ConfigOperationalEvent::Diagnostics(ConfigDiagnosticsOutcome::Warning),
+                "warning",
+                "runtime_config_diagnostics_warning",
+            ),
+            (
+                ConfigOperationalEvent::Diagnostics(ConfigDiagnosticsOutcome::Error),
+                "warning",
+                "runtime_config_diagnostics_error",
+            ),
+        ];
+
+        for (event, level, code) in cases {
+            let service = LoggingService::new_disabled(ServiceConfig::default());
+            record_config_operational_event_with_service(&service, event);
+            assert_eq!(
+                recorded_audits(&service),
+                vec![serde_json::json!({
+                    "kind": "audit",
+                    "level": level,
+                    "message": code,
+                })],
+                "config hook {event:?} must emit exactly one {code} audit"
+            );
+        }
+    }
+
+    #[test]
+    fn every_discovery_operational_event_emits_exactly_its_allowed_code() {
+        let cases = [
+            (
+                DiscoveryOperationalEvent::DecisionJoin,
+                "info",
+                "runtime_discovery_decision_join",
+            ),
+            (
+                DiscoveryOperationalEvent::DecisionStartNew,
+                "info",
+                "runtime_discovery_decision_start_new",
+            ),
+            (
+                DiscoveryOperationalEvent::JoinStarted,
+                "info",
+                "runtime_discovery_join_started",
+            ),
+            (
+                DiscoveryOperationalEvent::JoinSucceeded,
+                "info",
+                "runtime_discovery_join_succeeded",
+            ),
+            (
+                DiscoveryOperationalEvent::JoinFailed,
+                "warning",
+                "runtime_discovery_join_failed",
+            ),
+            (
+                DiscoveryOperationalEvent::DiscoveryFailed,
+                "warning",
+                "runtime_discovery_failed",
+            ),
+        ];
+
+        for (event, level, code) in cases {
+            let service = LoggingService::new_disabled(ServiceConfig::default());
+            record_discovery_operational_event_with_service(&service, event);
+            assert_eq!(
+                recorded_audits(&service),
+                vec![serde_json::json!({
+                    "kind": "audit",
+                    "level": level,
+                    "message": code,
+                })],
+                "discovery hook {event:?} must emit exactly one {code} audit"
+            );
+        }
+    }
+
+    #[test]
+    fn every_local_serving_operational_event_emits_exactly_its_allowed_code() {
+        let cases = [
+            (
+                LocalServingOperationalEvent::TargetAdded,
+                "info",
+                "runtime_local_target_added",
+            ),
+            (
+                LocalServingOperationalEvent::TargetRemoved,
+                "info",
+                "runtime_local_target_removed",
+            ),
+            (
+                LocalServingOperationalEvent::Ready,
+                "info",
+                "runtime_local_serving_ready",
+            ),
+            (
+                LocalServingOperationalEvent::Unavailable,
+                "info",
+                "runtime_local_serving_unavailable",
+            ),
+        ];
+
+        for (event, level, code) in cases {
+            let service = LoggingService::new_disabled(ServiceConfig::default());
+            record_local_serving_operational_event_with_service(&service, event);
+            assert_eq!(
+                recorded_audits(&service),
+                vec![serde_json::json!({
+                    "kind": "audit",
+                    "level": level,
+                    "message": code,
+                })],
+                "local-serving hook {event:?} must emit exactly one {code} audit"
+            );
         }
     }
 }

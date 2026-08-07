@@ -182,3 +182,61 @@ async fn runtime_logging_startup_cleanup_precedes_readiness_and_reopen_keeps_sur
     .await;
     assert!(!reopened_service.is_spawned());
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn cli_sourced_audit_records_durably_with_static_code() {
+    let temporary_directory = tempfile::tempdir().expect("temporary logging root");
+    let clock: Arc<dyn mesh_llm_log_store::Clock> =
+        Arc::new(FixedStoreClock("2026-08-07T12:00:00Z"));
+    crate::initialize_logging_foundation_with_store_clock_for_test(
+        &mesh_llm_config::LoggingConfig {
+            application_state_root: Some(temporary_directory.path().join("logging")),
+            ..Default::default()
+        },
+        clock,
+    )
+    .await;
+
+    let service = start_run_auto_logging_service()
+        .await
+        .expect("startable logging service");
+    let state = crate::logging_runtime_state().expect("installed logging runtime");
+
+    let record = crate::OperationalAuditRecord::builder("cli", "cli_command_started")
+        .severity(crate::OperationalAuditSeverity::Info)
+        .build();
+    assert!(
+        state.write_operational_audit(record),
+        "startable logging state must accept the cli record"
+    );
+
+    let store = state.store().expect("healthy metadata store");
+    let mut durable = Vec::new();
+    for _ in 0..50 {
+        let page = store
+            .list_audit_entries(
+                Some(10),
+                None,
+                mesh_llm_log_store::AuditEntryFilters {
+                    source: Some(mesh_llm_log_store::AuditEntrySource::Cli),
+                    severity: None,
+                },
+            )
+            .expect("list cli audit entries");
+        durable = page.items;
+        if !durable.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(durable.len(), 1);
+    assert_eq!(durable[0].source, "cli");
+    assert_eq!(durable[0].code, "cli_command_started");
+    assert_eq!(
+        durable[0].severity,
+        Some(mesh_llm_log_store::AuditEntrySeverity::Info)
+    );
+    assert!(service.shutdown().await);
+}

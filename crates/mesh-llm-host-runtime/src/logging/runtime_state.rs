@@ -749,11 +749,9 @@ impl LoggingRuntimeState {
 
     /// Record one static operational audit without exposing the service to
     /// producers. Disabled, unavailable, and retired logging remain fail-open
-    /// for the calling runtime path.
-    pub(crate) fn write_operational_audit(
-        &self,
-        record: super::service::OperationalAuditRecord,
-    ) -> bool {
+    /// for the calling runtime path. This is the durable seam the CLI audit
+    /// bridge uses after logging runtime initialization.
+    pub fn write_operational_audit(&self, record: super::service::OperationalAuditRecord) -> bool {
         if self.retired.load(Ordering::Acquire) {
             return false;
         }
