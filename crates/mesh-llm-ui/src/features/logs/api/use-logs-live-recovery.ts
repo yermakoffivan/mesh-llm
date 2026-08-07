@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { LogsApiClient } from '@/features/logs/api/client'
-import { LogReplayCursor, type LogReplayChannel } from '@/features/logs/api/ids'
+import { LogAuditCursor, LogReplayCursor, type LogReplayChannel } from '@/features/logs/api/ids'
 import { parseLogsSseFrame, type LogsSseFilter } from '@/features/logs/api/sse'
 import { resolveRelativeTime, type RelativeTimePreset } from '@/features/logs/lib/log-search'
 import type { LogsLedgerSearch } from '@/features/logs/lib/log-search'
@@ -132,7 +132,7 @@ export function useLogsLiveRecovery({
   const requestIdsRef = useRef(new Set<string>())
   const hydrateInFlightRef = useRef(false)
   const hydratePendingRef = useRef(false)
-  const latestCursorRef = useRef<LogReplayCursor | undefined>(undefined)
+  const latestCursorRef = useRef<LogReplayCursor | LogAuditCursor | undefined>(undefined)
   const restoredCursorValueRef = useRef<string | undefined>(undefined)
 
   /* Resolve timeRange → from/to bounds once; used for both filter scope and SSE subscription. */
@@ -266,7 +266,7 @@ export function useLogsLiveRecovery({
     const url = new LogsApiClient().logsEventSourceUrl({
       channels,
       filters: subscriptionFilters,
-      cursor: latestCursorRef.current
+      cursor: latestCursorRef.current instanceof LogReplayCursor ? latestCursorRef.current : undefined
     })
     hydrateAuthoritatively(false)
 

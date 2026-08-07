@@ -19,12 +19,14 @@ import {
   parseLogExport,
   parseLogArtifact,
   parseLogArtifactPage,
+  parseLogAuditPage,
   parseLogLifecycleEventPage,
   parseLogProxyPage,
   parseLogRequest,
   parseLogRequestPage,
   parseLogWebhookRetryReceipt,
   type LogArtifact,
+  type LogAuditPage,
   type LogCleanupReceipt,
   type LogCleanupOutcome,
   type LogDeleteReceipt,
@@ -75,6 +77,13 @@ export type LogsProxyQuery = LogsPageQuery & {
   readonly provider?: string
   readonly engine?: string
   readonly status?: number
+}
+
+export type LogAuditQuery = {
+  readonly cursor?: LogPageCursor
+  readonly limit?: number
+  readonly source?: string
+  readonly severity?: string
 }
 
 export type LogArtifactDownload = {
@@ -316,6 +325,23 @@ export class LogsApiClient {
     setQueryValue(params, 'engine', query.engine)
     setQueryValue(params, 'status', query.status)
     return this.getJson(appendQuery('/api/logs/proxy', params.toString()), parseLogProxyPage)
+  }
+  async listAudits(query: LogAuditQuery = {}, mode: DataMode = 'live'): Promise<LogsCapability<LogAuditPage>> {
+    if (mode === 'harness') {
+      return { state: 'supported', value: { items: [], nextCursor: undefined } }
+    }
+    const params = new URLSearchParams()
+    setQueryValue(params, 'cursor', query.cursor?.toString())
+    setQueryValue(params, 'limit', query.limit)
+    setQueryValue(params, 'source', query.source)
+    setQueryValue(params, 'severity', query.severity)
+    const response = await this.#fetch(endpoint(appendQuery('/api/logs/audit', params.toString())))
+    if (!response.ok) {
+      const error = await responseError(response)
+      if (isUnsupportedResponse(response, error)) return { state: 'unsupported' }
+      throw error
+    }
+    return { state: 'supported', value: parseLogAuditPage(await responseJson(response)) }
   }
   logsEventSourceUrl(subscription: LogsSseSubscription) {
     return endpoint(appendQuery('/api/logs/events', serializeLogsSseSubscription(subscription)))

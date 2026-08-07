@@ -18,6 +18,8 @@ export class LogsDtoError extends Error {
 
 export type LogOutcome = 'active' | 'completed' | 'failed' | 'rejected' | 'cancelled' | 'dropped'
 export type LogSource = 'active' | 'durable'
+export type LogAuditSource = 'logging_service' | 'runtime' | 'mesh' | 'cli'
+export type LogAuditSeverity = 'info' | 'warning' | 'error'
 export type LogEventKind =
   | 'admitted'
   | 'route_selected'
@@ -46,6 +48,15 @@ export type LogRequest = {
   readonly engine: string | undefined
   readonly statusCode: number | undefined
   readonly source: LogSource
+}
+
+export type LogAuditEntry = {
+  readonly entryId: string
+  readonly occurredAt: string
+  readonly source: LogAuditSource
+  readonly code: string
+  readonly severity?: LogAuditSeverity
+  readonly sequence: number
 }
 
 export type LogLifecycleEvent = {
@@ -95,6 +106,11 @@ export type LogProxyAttempt = {
 
 export type LogsPage<T> = {
   readonly items: readonly T[]
+  readonly nextCursor: LogPageCursor | undefined
+}
+
+export type LogAuditPage = {
+  readonly items: readonly LogAuditEntry[]
   readonly nextCursor: LogPageCursor | undefined
 }
 
@@ -190,6 +206,8 @@ const eventKindSchema = v.picklist([
   'dropped'
 ])
 const channelSchema = v.picklist(['requests', 'operations', 'system'])
+const auditSourceSchema = v.picklist(['logging_service', 'runtime', 'mesh', 'cli'])
+const auditSeveritySchema = v.picklist(['info', 'warning', 'error'])
 const safeIntegerSchema = v.pipe(
   v.number(),
   v.integer(),
@@ -374,6 +392,25 @@ const replayGapSchema = v.object({
   })
 })
 
+const auditEntrySchema = v.object({
+  entryId: v.pipe(v.string(), v.minLength(1)),
+  occurredAt: timestampSchema,
+  source: auditSourceSchema,
+  code: v.string(),
+  severity: v.optional(auditSeveritySchema),
+  sequence: v.pipe(nonNegativeIntegerSchema, v.minValue(1))
+})
+
+const auditGapSchema = v.object({
+  channel: v.literal('audit'),
+  fromSequence: v.pipe(nonNegativeIntegerSchema, v.minValue(1)),
+  toSequence: v.pipe(nonNegativeIntegerSchema, v.minValue(1)),
+  recovery: v.object({
+    endpoint: v.literal('/api/logs/audit'),
+    cursor: v.optional(v.nullable(v.string()))
+  })
+})
+
 function parseRequestWire(input: unknown) {
   try {
     return v.parse(requestSchema, input)
@@ -417,6 +454,22 @@ function parseReplayEventWire(input: unknown) {
 function parseReplayGapWire(input: unknown) {
   try {
     return v.parse(replayGapSchema, input)
+  } catch {
+    throw new LogsDtoError()
+  }
+}
+
+export function parseAuditEntryWire(input: unknown) {
+  try {
+    return v.parse(auditEntrySchema, input)
+  } catch {
+    throw new LogsDtoError()
+  }
+}
+
+export function parseAuditGapWire(input: unknown) {
+  try {
+    return v.parse(auditGapSchema, input)
   } catch {
     throw new LogsDtoError()
   }
@@ -573,6 +626,16 @@ export function parseLogProxyPage(input: unknown): LogsPage<LogProxyAttempt> {
   }
 }
 
+export function parseLogAuditPage(input: unknown): LogAuditPage {
+  try {
+    const page = v.parse(v.object({ items: v.array(auditEntrySchema), nextCursor: v.nullable(v.string()) }), input)
+    return { items: page.items, nextCursor: parsePageCursor(page.nextCursor) }
+  } catch (error) {
+    if (error instanceof LogsDtoError) throw error
+    throw new LogsDtoError()
+  }
+}
+
 function parseOperation<T>(schema: v.BaseSchema<unknown, T, v.BaseIssue<unknown>>, input: unknown): T {
   try {
     return v.parse(schema, input)
@@ -652,4 +715,12 @@ export function parseReplayGap(input: unknown): ParsedReplayGap {
     throw new LogsDtoError()
   }
   return { ...gap, recovery: { endpoint: gap.recovery.endpoint, cursor } }
+}
+
+export function parseAuditEntry(input: unknown) {
+  return parseAuditEntryWire(input)
+}
+
+export function parseAuditGap(input: unknown) {
+  return parseAuditGapWire(input)
 }

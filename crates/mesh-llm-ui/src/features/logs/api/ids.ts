@@ -215,4 +215,32 @@ export class LogReplayCursor {
   }
 }
 
+export class LogAuditCursor {
+  readonly #sequence: bigint
+
+  private constructor(sequence: bigint) {
+    this.#sequence = sequence
+  }
+
+  static parse(value: string) {
+    const match = /^a1:(\d+)$/.exec(value)
+    if (!match) throw new LogsIdentifierError('audit cursor')
+
+    try {
+      return new LogAuditCursor(BigInt(match[1]))
+    } catch {
+      throw new LogsIdentifierError('audit cursor')
+    }
+  }
+
+  sequence() {
+    return this.#sequence
+  }
+
+  toString() {
+    return `a1:${this.#sequence}`
+  }
+}
+
 export type LogReplayChannel = 'requests' | 'operations' | 'system'
+export type LogAuditChannel = 'audit'
