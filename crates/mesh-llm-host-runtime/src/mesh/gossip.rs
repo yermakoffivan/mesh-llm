@@ -885,7 +885,7 @@ impl Node {
         }
         drop(state);
         if newly_rejected {
-            record_mesh_operational_event(MeshOperationalEvent::GossipPeerRejectedPolicy);
+            record_mesh_operational_event(MeshOperationalEvent::GossipPolicyRejected);
         }
         true
     }
@@ -971,7 +971,7 @@ impl Node {
             .count();
         drop(state);
         self.capture_peer_observation("peer_direct_add", &peer, "direct", None);
-        record_mesh_operational_event(MeshOperationalEvent::GossipPeerPromoted);
+        record_mesh_operational_event(MeshOperationalEvent::GossipDirectPeerPromoted);
         let _ = self.peer_change_tx.send(count);
         self.emit_plugin_mesh_event(
             crate::plugin::proto::mesh_event::Kind::PeerUp,
@@ -1440,7 +1440,7 @@ impl Node {
             // the dispatcher's `accept_*` calls error so it unwinds cleanly.
             self.state.lock().await.connections.remove(&peer_id);
             conn.close(0u32.into(), b"join announcement-apply failed");
-            record_mesh_operational_event(MeshOperationalEvent::DiscoveryJoinFailed);
+            record_mesh_operational_event(MeshOperationalEvent::AutoJoinFailed);
             return Err(error);
         }
 
@@ -1460,7 +1460,7 @@ impl Node {
             peer_id.fmt_short(),
             elapsed_ms_u64(elapsed)
         ));
-        record_mesh_operational_event(MeshOperationalEvent::DiscoveryJoinSucceeded);
+        record_mesh_operational_event(MeshOperationalEvent::AutoJoinSucceeded);
 
         Ok((candidate.token, candidate.mesh_name))
     }
@@ -1671,7 +1671,7 @@ impl Node {
                 id.fmt_short(),
                 ann.version
             );
-            record_mesh_operational_event(MeshOperationalEvent::GossipPeerRejectedVersion);
+            record_mesh_operational_event(MeshOperationalEvent::GossipIncompatibleVersionRejected);
             self.remove_disallowed_peer(id).await;
             return false;
         }

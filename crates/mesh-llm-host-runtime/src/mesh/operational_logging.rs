@@ -24,51 +24,56 @@ fn operational_audit_record(code: &'static str, level: &'static str) -> Operatio
 }
 
 /// Static outcomes that are safe to publish through the local operational log.
+///
+/// Variants and codes follow the reviewed mesh audit vocabulary. `QuicInboundAccepted`
+/// describes a non-Skippy inbound QUIC connection accepted after the Skippy ALPN
+/// exclusion; there is no `quic_alpn_accepted` code because no explicit mesh-ALPN
+/// validation branch exists in the inbound path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MeshOperationalEvent {
-    QuicAlpnAccepted,
-    QuicInboundFailed,
+    QuicHandlerFailed,
+    QuicInboundAccepted,
+    ControlHandlerFailed,
     ControlAlpnRejected,
     ControlConnectionAccepted,
-    ControlConnectionFailed,
-    GossipPeerPromoted,
-    GossipPeerRejectedPolicy,
-    GossipPeerRejectedVersion,
+    GossipPolicyRejected,
+    GossipDirectPeerPromoted,
+    GossipIncompatibleVersionRejected,
     GossipPeerRemoved,
-    DiscoveryJoinSucceeded,
-    DiscoveryJoinFailed,
+    AutoJoinSucceeded,
+    AutoJoinFailed,
 }
 
 impl MeshOperationalEvent {
     const fn level(self) -> &'static str {
         match self {
-            Self::QuicAlpnAccepted
+            Self::QuicInboundAccepted
             | Self::ControlConnectionAccepted
-            | Self::GossipPeerPromoted
+            | Self::GossipDirectPeerPromoted
             | Self::GossipPeerRemoved
-            | Self::DiscoveryJoinSucceeded => OPERATIONAL_AUDIT_INFO,
-            Self::QuicInboundFailed
+            | Self::AutoJoinSucceeded => OPERATIONAL_AUDIT_INFO,
+            Self::QuicHandlerFailed
+            | Self::ControlHandlerFailed
             | Self::ControlAlpnRejected
-            | Self::ControlConnectionFailed
-            | Self::GossipPeerRejectedPolicy
-            | Self::GossipPeerRejectedVersion
-            | Self::DiscoveryJoinFailed => OPERATIONAL_AUDIT_WARNING,
+            | Self::GossipPolicyRejected
+            | Self::GossipIncompatibleVersionRejected
+            | Self::AutoJoinFailed => OPERATIONAL_AUDIT_WARNING,
         }
     }
 
     const fn code(self) -> &'static str {
         match self {
-            Self::QuicAlpnAccepted => "mesh_quic_alpn_accepted",
-            Self::QuicInboundFailed => "mesh_quic_inbound_failed",
+            Self::QuicHandlerFailed => "mesh_quic_handler_failed",
+            Self::QuicInboundAccepted => "mesh_quic_inbound_accepted",
+            Self::ControlHandlerFailed => "mesh_control_handler_failed",
             Self::ControlAlpnRejected => "mesh_control_alpn_rejected",
             Self::ControlConnectionAccepted => "mesh_control_connection_accepted",
-            Self::ControlConnectionFailed => "mesh_control_connection_failed",
-            Self::GossipPeerPromoted => "mesh_gossip_peer_promoted",
-            Self::GossipPeerRejectedPolicy => "mesh_gossip_peer_rejected_policy",
-            Self::GossipPeerRejectedVersion => "mesh_gossip_peer_rejected_version",
-            Self::GossipPeerRemoved => "mesh_gossip_peer_removed",
-            Self::DiscoveryJoinSucceeded => "mesh_discovery_join_succeeded",
-            Self::DiscoveryJoinFailed => "mesh_discovery_join_failed",
+            Self::GossipPolicyRejected => "gossip_policy_rejected",
+            Self::GossipDirectPeerPromoted => "gossip_direct_peer_promoted",
+            Self::GossipIncompatibleVersionRejected => "gossip_incompatible_version_rejected",
+            Self::GossipPeerRemoved => "gossip_peer_removed",
+            Self::AutoJoinSucceeded => "mesh_auto_join_succeeded",
+            Self::AutoJoinFailed => "mesh_auto_join_failed",
         }
     }
 }
@@ -92,7 +97,10 @@ fn record_mesh_operational_event_with_service(
 
 #[cfg(test)]
 mod tests {
-    use super::{MeshOperationalEvent, record_mesh_operational_event_with_service};
+    use super::{
+        MeshOperationalEvent, record_mesh_operational_event,
+        record_mesh_operational_event_with_service,
+    };
     use crate::logging::{LoggingService, ServiceConfig};
 
     fn recorded_audits(service: &LoggingService) -> Vec<serde_json::Value> {
@@ -116,12 +124,12 @@ mod tests {
     fn mesh_boundary_outcomes_emit_exact_static_audits_without_raw_metadata() {
         let service = LoggingService::new_disabled(ServiceConfig::default());
         let events = [
-            MeshOperationalEvent::QuicAlpnAccepted,
+            MeshOperationalEvent::QuicInboundAccepted,
             MeshOperationalEvent::ControlAlpnRejected,
-            MeshOperationalEvent::ControlConnectionFailed,
-            MeshOperationalEvent::GossipPeerPromoted,
-            MeshOperationalEvent::GossipPeerRejectedPolicy,
-            MeshOperationalEvent::DiscoveryJoinFailed,
+            MeshOperationalEvent::ControlHandlerFailed,
+            MeshOperationalEvent::GossipDirectPeerPromoted,
+            MeshOperationalEvent::GossipPolicyRejected,
+            MeshOperationalEvent::AutoJoinFailed,
         ];
 
         for event in events {
@@ -135,7 +143,7 @@ mod tests {
                 serde_json::json!({
                     "kind": "audit",
                     "level": "info",
-                    "message": "mesh_quic_alpn_accepted",
+                    "message": "mesh_quic_inbound_accepted",
                 }),
                 serde_json::json!({
                     "kind": "audit",
@@ -145,22 +153,22 @@ mod tests {
                 serde_json::json!({
                     "kind": "audit",
                     "level": "warning",
-                    "message": "mesh_control_connection_failed",
+                    "message": "mesh_control_handler_failed",
                 }),
                 serde_json::json!({
                     "kind": "audit",
                     "level": "info",
-                    "message": "mesh_gossip_peer_promoted",
+                    "message": "gossip_direct_peer_promoted",
                 }),
                 serde_json::json!({
                     "kind": "audit",
                     "level": "warning",
-                    "message": "mesh_gossip_peer_rejected_policy",
+                    "message": "gossip_policy_rejected",
                 }),
                 serde_json::json!({
                     "kind": "audit",
                     "level": "warning",
-                    "message": "mesh_discovery_join_failed",
+                    "message": "mesh_auto_join_failed",
                 }),
             ]
         );
@@ -181,17 +189,17 @@ mod tests {
     #[test]
     fn mesh_operational_vocabulary_is_bounded_and_identifier_free() {
         let events = [
-            MeshOperationalEvent::QuicAlpnAccepted,
-            MeshOperationalEvent::QuicInboundFailed,
+            MeshOperationalEvent::QuicHandlerFailed,
+            MeshOperationalEvent::QuicInboundAccepted,
+            MeshOperationalEvent::ControlHandlerFailed,
             MeshOperationalEvent::ControlAlpnRejected,
             MeshOperationalEvent::ControlConnectionAccepted,
-            MeshOperationalEvent::ControlConnectionFailed,
-            MeshOperationalEvent::GossipPeerPromoted,
-            MeshOperationalEvent::GossipPeerRejectedPolicy,
-            MeshOperationalEvent::GossipPeerRejectedVersion,
+            MeshOperationalEvent::GossipPolicyRejected,
+            MeshOperationalEvent::GossipDirectPeerPromoted,
+            MeshOperationalEvent::GossipIncompatibleVersionRejected,
             MeshOperationalEvent::GossipPeerRemoved,
-            MeshOperationalEvent::DiscoveryJoinSucceeded,
-            MeshOperationalEvent::DiscoveryJoinFailed,
+            MeshOperationalEvent::AutoJoinSucceeded,
+            MeshOperationalEvent::AutoJoinFailed,
         ];
 
         for event in events {
@@ -204,5 +212,73 @@ mod tests {
             );
             assert!(matches!(event.level(), "info" | "warning"));
         }
+    }
+
+    #[test]
+    fn mesh_operational_vocabulary_maps_each_variant_to_its_reviewed_code() {
+        let cases = [
+            (
+                MeshOperationalEvent::QuicHandlerFailed,
+                "mesh_quic_handler_failed",
+            ),
+            (
+                MeshOperationalEvent::QuicInboundAccepted,
+                "mesh_quic_inbound_accepted",
+            ),
+            (
+                MeshOperationalEvent::ControlHandlerFailed,
+                "mesh_control_handler_failed",
+            ),
+            (
+                MeshOperationalEvent::ControlAlpnRejected,
+                "mesh_control_alpn_rejected",
+            ),
+            (
+                MeshOperationalEvent::ControlConnectionAccepted,
+                "mesh_control_connection_accepted",
+            ),
+            (
+                MeshOperationalEvent::GossipPolicyRejected,
+                "gossip_policy_rejected",
+            ),
+            (
+                MeshOperationalEvent::GossipDirectPeerPromoted,
+                "gossip_direct_peer_promoted",
+            ),
+            (
+                MeshOperationalEvent::GossipIncompatibleVersionRejected,
+                "gossip_incompatible_version_rejected",
+            ),
+            (
+                MeshOperationalEvent::GossipPeerRemoved,
+                "gossip_peer_removed",
+            ),
+            (
+                MeshOperationalEvent::AutoJoinSucceeded,
+                "mesh_auto_join_succeeded",
+            ),
+            (
+                MeshOperationalEvent::AutoJoinFailed,
+                "mesh_auto_join_failed",
+            ),
+        ];
+        for (event, expected_code) in cases {
+            assert_eq!(
+                event.code(),
+                expected_code,
+                "reviewed vocabulary code must be exact"
+            );
+        }
+    }
+
+    #[test]
+    fn record_mesh_operational_event_is_fail_open_without_logging_service() {
+        // When the process-local logging runtime state is absent the adapter
+        // must be a no-op; when a concurrent logging test installed state the
+        // bounded write path must equally never panic (fail-open by contract).
+        record_mesh_operational_event(MeshOperationalEvent::QuicHandlerFailed);
+        record_mesh_operational_event(MeshOperationalEvent::AutoJoinFailed);
+        record_mesh_operational_event(MeshOperationalEvent::GossipPolicyRejected);
+        record_mesh_operational_event(MeshOperationalEvent::QuicInboundAccepted);
     }
 }

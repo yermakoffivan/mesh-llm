@@ -1321,7 +1321,7 @@ fn audit_entry_query_handles_nullable_request_empty_page_and_allowlisted_filters
             None,
             "2025-06-15T12:00:01Z",
             "mesh",
-            "mesh_quic_inbound_failed",
+            "mesh_quic_handler_failed",
             Some(r#"{"severity":"warning"}"#),
         )
         .unwrap();

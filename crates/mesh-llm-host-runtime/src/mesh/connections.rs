@@ -655,7 +655,7 @@ impl Node {
             let node = self.clone();
             tokio::spawn(async move {
                 if let Err(e) = node.handle_incoming(incoming).await {
-                    record_mesh_operational_event(MeshOperationalEvent::QuicInboundFailed);
+                    record_mesh_operational_event(MeshOperationalEvent::QuicHandlerFailed);
                     tracing::warn!("Incoming connection error: {e}");
                 }
             });
@@ -681,7 +681,7 @@ impl Node {
                     let node = self.clone();
                     tokio::spawn(Box::pin(async move {
                         if let Err(error) = node.handle_control_incoming(incoming).await {
-                            record_mesh_operational_event(MeshOperationalEvent::ControlConnectionFailed);
+                            record_mesh_operational_event(MeshOperationalEvent::ControlHandlerFailed);
                             tracing::debug!("Control-plane incoming connection error: {error}");
                         }
                     }));
@@ -753,7 +753,7 @@ impl Node {
         if self.handle_stage_alpn(&alpn, conn.clone(), remote).await {
             return Ok(());
         }
-        record_mesh_operational_event(MeshOperationalEvent::QuicAlpnAccepted);
+        record_mesh_operational_event(MeshOperationalEvent::QuicInboundAccepted);
         tracing::info!("Inbound connection from {}", remote.fmt_short());
 
         // Store connection for stream dispatch (tunneling, route requests, etc.)
