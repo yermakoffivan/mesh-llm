@@ -72,6 +72,41 @@ impl Cursor {
     }
 }
 
+/// Audit-mode cursor: `a1:<seq>`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct AuditCursor(pub(super) u64);
+
+impl AuditCursor {
+    pub(super) fn parse(value: &str) -> Result<Self, LogsError> {
+        let seq = value
+            .strip_prefix("a1:")
+            .ok_or(LogsError::InvalidCursor)?
+            .parse()
+            .map_err(|_| LogsError::InvalidCursor)?;
+        Ok(Self(seq))
+    }
+
+    pub(super) fn sequence(self) -> u64 {
+        self.0
+    }
+
+    pub(super) fn event_id(self) -> String {
+        format!("a1:{}", self.0)
+    }
+
+    pub(super) fn advance(&mut self, sequence: u64) {
+        self.0 = self.0.max(sequence);
+    }
+}
+
+/// Audit subscription filters.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(in crate::api::routes::logs) struct AuditSelection {
+    pub(super) cursor: AuditCursor,
+    pub(super) source: Option<String>,
+    pub(super) severity: Option<String>,
+}
+
 fn parse_sequence(value: Option<&str>) -> Result<u64, LogsError> {
     value
         .ok_or(LogsError::InvalidCursor)?
@@ -84,6 +119,13 @@ pub(in crate::api::routes::logs) struct Subscription {
     pub(super) channels: Vec<ReplayChannel>,
     pub(super) filters: LedgerFilters,
     pub(super) cursor: Cursor,
+    pub(in crate::api::routes::logs) audit: Option<AuditSelection>,
+}
+
+impl Subscription {
+    pub(in crate::api::routes::logs) fn is_audit(&self) -> bool {
+        self.audit.is_some()
+    }
 }
 
 pub(in crate::api::routes::logs) fn parse_subscription(
@@ -94,14 +136,34 @@ pub(in crate::api::routes::logs) fn parse_subscription(
     let parsed = parse_query(path)?;
     let reconnect = unique_header(raw_request, "last-event-id")?
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(Cursor::parse)
-        .transpose()?
-        .unwrap_or_default();
+        .filter(|value| !value.is_empty());
+    let cursor = if parsed.audit.is_some() {
+        Cursor::default()
+    } else {
+        let header_cursor = reconnect
+            .map(Cursor::parse)
+            .transpose()?
+            .unwrap_or_default();
+        parsed.cursor.merge_max(header_cursor)
+    };
+    let audit = if let Some(sel) = parsed.audit {
+        let header_cursor = reconnect
+            .map(AuditCursor::parse)
+            .transpose()?
+            .unwrap_or_default();
+        let mut merged = sel;
+        if header_cursor.sequence() > merged.cursor.sequence() {
+            merged.cursor = header_cursor;
+        }
+        Some(merged)
+    } else {
+        None
+    };
     Ok(Subscription {
         channels: parsed.channels,
         filters: parsed.filters,
-        cursor: parsed.cursor.merge_max(reconnect),
+        cursor,
+        audit,
     })
 }
 
@@ -109,6 +171,7 @@ struct ParsedQuery {
     channels: Vec<ReplayChannel>,
     filters: LedgerFilters,
     cursor: Cursor,
+    audit: Option<AuditSelection>,
 }
 
 /// The event stream accepts the bounded replay-matchable ledger vocabulary as
@@ -138,9 +201,24 @@ fn parse_query(path: &str) -> Result<ParsedQuery, LogsError> {
     let mut channels = Vec::new();
     let mut filters = LedgerFilters::default();
     let mut cursor = None;
+    let mut audit_mode = false;
+    let mut audit_selection = AuditSelection::default();
+    let mut audit_cursor_set = false;
+
     for (key, value) in pairs {
         match key.as_ref() {
+            "audit" => {
+                if value != "1" && value != "true" {
+                    return Err(LogsError::InvalidQuery("audit parameter must be 1 or true"));
+                }
+                audit_mode = true;
+            }
             "channel" => {
+                if audit_mode {
+                    return Err(LogsError::InvalidQuery(
+                        "channel is not supported in audit mode",
+                    ));
+                }
                 let channel = parse_channel(&value)?;
                 if channels.contains(&channel) {
                     return Err(LogsError::InvalidQuery("duplicate channel"));
@@ -148,29 +226,89 @@ fn parse_query(path: &str) -> Result<ParsedQuery, LogsError> {
                 channels.push(channel);
             }
             "filter" => {
+                if audit_mode {
+                    return Err(LogsError::InvalidQuery(
+                        "filter is not supported in audit mode",
+                    ));
+                }
                 filters.insert_encoded(&value)?;
             }
             "from" | "to" | "route" | "model" | "provider" | "engine" | "outcome"
-            | "request_id" => filters.insert(key.as_ref(), &value)?,
-            "source" => {
-                return Err(LogsError::InvalidQuery(
-                    "filter is unsupported for event streams",
-                ));
+            | "request_id" => {
+                if audit_mode {
+                    return Err(LogsError::InvalidQuery(
+                        "lifecycle filters are not supported in audit mode",
+                    ));
+                }
+                filters.insert(key.as_ref(), &value)?;
             }
-            "cursor" if cursor.is_none() => cursor = Some(Cursor::parse(nonempty(&value)?)?),
+            "source" => {
+                if audit_mode {
+                    let source = parse_audit_source(&value)?;
+                    if audit_selection.source.is_some() {
+                        return Err(LogsError::InvalidQuery("duplicate audit source"));
+                    }
+                    audit_selection.source = Some(source);
+                } else {
+                    return Err(LogsError::InvalidQuery(
+                        "filter is unsupported for event streams",
+                    ));
+                }
+            }
+            "severity" => {
+                if audit_mode {
+                    let severity = parse_audit_severity(&value)?;
+                    if audit_selection.severity.is_some() {
+                        return Err(LogsError::InvalidQuery("duplicate audit severity"));
+                    }
+                    audit_selection.severity = Some(severity);
+                } else {
+                    return Err(LogsError::InvalidQuery("unknown event stream parameter"));
+                }
+            }
+            "cursor" if cursor.is_none() && !audit_mode => {
+                cursor = Some(Cursor::parse(nonempty(&value)?)?);
+            }
+            "cursor" if audit_mode && !audit_cursor_set => {
+                audit_selection.cursor = AuditCursor::parse(nonempty(&value)?)?;
+                audit_cursor_set = true;
+            }
             "cursor" => return Err(LogsError::InvalidQuery("duplicate cursor")),
             _ => return Err(LogsError::InvalidQuery("unknown event stream parameter")),
         }
     }
-    if channels.is_empty() {
+
+    if !audit_mode && channels.is_empty() {
         return Err(LogsError::InvalidQuery("at least one channel is required"));
     }
-    filters.validate_time_range()?;
+    if !audit_mode {
+        filters.validate_time_range()?;
+    }
+
     Ok(ParsedQuery {
         channels,
         filters,
         cursor: cursor.unwrap_or_default(),
+        audit: if audit_mode {
+            Some(audit_selection)
+        } else {
+            None
+        },
     })
+}
+
+fn parse_audit_source(value: &str) -> Result<String, LogsError> {
+    match value {
+        "logging_service" | "runtime" | "mesh" | "cli" => Ok(value.to_owned()),
+        _ => Err(LogsError::InvalidQuery("audit source is invalid")),
+    }
+}
+
+fn parse_audit_severity(value: &str) -> Result<String, LogsError> {
+    match value {
+        "info" | "warning" | "error" => Ok(value.to_owned()),
+        _ => Err(LogsError::InvalidQuery("audit severity is invalid")),
+    }
 }
 
 impl LedgerFilters {
@@ -487,6 +625,109 @@ mod tests {
                 "/api/logs/events?channel=requests&filter=source%3Aactive",
                 REQUEST
             ),
+            Err(LogsError::InvalidQuery(
+                "filter is unsupported for event streams"
+            ))
+        ));
+    }
+
+    #[test]
+    fn audit_mode_parses_without_channel() {
+        let subscription =
+            parse_subscription("/api/logs/events?audit=1", REQUEST).expect("audit mode parses");
+        assert!(subscription.is_audit());
+        assert!(subscription.channels.is_empty());
+    }
+
+    #[test]
+    fn audit_mode_accepts_source_and_severity() {
+        let subscription = parse_subscription(
+            "/api/logs/events?audit=1&source=mesh&severity=warning",
+            REQUEST,
+        )
+        .expect("audit with filters parses");
+        let sel = subscription.audit.as_ref().unwrap();
+        assert_eq!(sel.source.as_deref(), Some("mesh"));
+        assert_eq!(sel.severity.as_deref(), Some("warning"));
+    }
+
+    #[test]
+    fn audit_mode_parses_audit_cursor() {
+        let subscription = parse_subscription("/api/logs/events?audit=1&cursor=a1:42", REQUEST)
+            .expect("audit cursor parses");
+        let sel = subscription.audit.as_ref().unwrap();
+        assert_eq!(sel.cursor.sequence(), 42);
+    }
+
+    #[test]
+    fn audit_mode_rejects_lifecycle_filters() {
+        for path in [
+            "/api/logs/events?audit=1&channel=requests",
+            "/api/logs/events?audit=1&route=chat",
+            "/api/logs/events?audit=1&model=Qwen",
+            "/api/logs/events?audit=1&provider=mesh",
+            "/api/logs/events?audit=1&engine=skippy",
+            "/api/logs/events?audit=1&outcome=completed",
+            "/api/logs/events?audit=1&request_id=00000000-0000-4000-8000-000000000001",
+            "/api/logs/events?audit=1&from=2026-01-01T00:00:00Z",
+            "/api/logs/events?audit=1&to=2026-01-01T00:00:00Z",
+            "/api/logs/events?audit=1&filter=source:active",
+        ] {
+            assert!(
+                parse_subscription(path, REQUEST).is_err(),
+                "audit mode must reject lifecycle param: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_mode_rejects_invalid_source_and_severity() {
+        for path in [
+            "/api/logs/events?audit=1&source=bogus",
+            "/api/logs/events?audit=1&severity=bogus",
+        ] {
+            assert!(
+                parse_subscription(path, REQUEST).is_err(),
+                "audit mode must reject invalid vocab: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_mode_rejects_non_boolean_audit_param() {
+        assert!(matches!(
+            parse_subscription("/api/logs/events?audit=yes", REQUEST),
+            Err(LogsError::InvalidQuery(_))
+        ));
+    }
+
+    #[test]
+    fn audit_last_event_id_merges_with_query_cursor() {
+        let request = b"GET /api/logs/events HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\nLast-Event-ID: a1:100\r\n\r\n";
+        let subscription = parse_subscription("/api/logs/events?audit=1&cursor=a1:50", request)
+            .expect("audit merge parses");
+        let sel = subscription.audit.as_ref().unwrap();
+        assert_eq!(sel.cursor.sequence(), 100);
+    }
+
+    #[test]
+    fn audit_cursor_rejects_malformed() {
+        for path in [
+            "/api/logs/events?audit=1&cursor=garbage",
+            "/api/logs/events?audit=1&cursor=v1:1.2.3",
+            "/api/logs/events?audit=1&cursor=a1:",
+        ] {
+            assert!(
+                parse_subscription(path, REQUEST).is_err(),
+                "malformed audit cursor must reject: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_audit_mode_still_rejects_source() {
+        assert!(matches!(
+            parse_subscription("/api/logs/events?channel=requests&source=active", REQUEST),
             Err(LogsError::InvalidQuery(
                 "filter is unsupported for event streams"
             ))

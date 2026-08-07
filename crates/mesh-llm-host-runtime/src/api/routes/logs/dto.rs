@@ -2,7 +2,8 @@ use base64::Engine;
 use mesh_llm_events::logging::envelope::CanonicalEnvelope;
 use mesh_llm_events::logging::events::LifecycleEvent;
 use mesh_llm_log_store::{
-    ArtifactContent, ArtifactRecord, EventRecord, ProxyRecord, RequestRecord,
+    ArtifactContent, ArtifactRecord, AuditEntryRow, AuditEntrySeverity, EventRecord, ProxyRecord,
+    RequestRecord,
 };
 use serde::Serialize;
 
@@ -248,6 +249,36 @@ impl From<ProxyRecord> for ProxyDto {
             started_at: record.started_at,
             completed_at: record.completed_at,
             status_code: record.status_code,
+        }
+    }
+}
+
+/// Sparse, privacy-safe projection of a durable audit entry for the
+/// trusted-local management API. No `request_id`, no `detail_json`, no
+/// message text — only the fixed vocabulary needed for operational review.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AuditDto {
+    entry_id: String,
+    occurred_at: String,
+    source: String,
+    code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    severity: Option<String>,
+}
+
+impl From<AuditEntryRow> for AuditDto {
+    fn from(row: AuditEntryRow) -> Self {
+        Self {
+            entry_id: row.entry_id,
+            occurred_at: row.occurred_at,
+            source: row.source,
+            code: row.code,
+            severity: row.severity.map(|s| match s {
+                AuditEntrySeverity::Info => "info".to_string(),
+                AuditEntrySeverity::Warning => "warning".to_string(),
+                AuditEntrySeverity::Error => "error".to_string(),
+            }),
         }
     }
 }

@@ -14,9 +14,10 @@ use std::time::Duration;
 use mesh_llm_events::logging::identifiers::EventId;
 use mesh_llm_log_store::{
     ARTIFACT_CAPTURE_DISABLED_PRIVACY_UNAVAILABLE, ArtifactCaptureDisabledReason,
-    ArtifactCaptureOutcome, ArtifactContent, ArtifactRecord, ArtifactRedactor, Clock as StoreClock,
-    EventRecord, FailOpenArtifactCapture, LogStore, LogStoreError, PageQuery, ProxyQuery,
-    ProxyRecord, QueryPage, RealClock, RequestQuery, RequestRecord,
+    ArtifactCaptureOutcome, ArtifactContent, ArtifactRecord, ArtifactRedactor, AuditEntryFilters,
+    AuditEntryRow, Clock as StoreClock, EventRecord, FailOpenArtifactCapture, LogStore,
+    LogStoreError, Page, PageQuery, ProxyQuery, ProxyRecord, QueryPage, RealClock, RequestQuery,
+    RequestRecord,
 };
 
 use super::cleanup::{CleanupOutcome, CleanupWorker, CleanupWorkerState, CleanupWorkerStatus};
@@ -186,6 +187,15 @@ impl LoggingQueryFacade {
         query: &ProxyQuery,
     ) -> Result<QueryPage<ProxyRecord>, LogStoreError> {
         self.store.query_proxy_records(query)
+    }
+
+    pub(crate) fn audit_entries(
+        &self,
+        limit: Option<usize>,
+        after_cursor: Option<&str>,
+        filters: AuditEntryFilters,
+    ) -> Result<Page<AuditEntryRow>, LogStoreError> {
+        self.store.list_audit_entries(limit, after_cursor, filters)
     }
 
     /// Read content only through the fail-open capture owner. The route core

@@ -29,7 +29,10 @@ mod webhook_delivery;
 mod webhook_scheduler;
 mod writer;
 
-pub use bus::{BusEntry, PushOutcome, ReplayBus, ReplayCursor, ReplayRecord, ReplayWindow};
+pub use bus::{
+    AuditReplayRecord, AuditReplayWindow, BusEntry, PushOutcome, ReplayBus, ReplayCursor,
+    ReplayRecord, ReplayWindow,
+};
 pub use foundation::LoggingFoundation;
 pub use lifecycle::{DuplicateTerminalError, LifecycleGuard, TerminalOutcome};
 pub use limits::{DynamicLoggingLimits, LoggingDynamicLimits};

@@ -17,7 +17,7 @@ mod webhook_retry;
 
 use std::collections::HashSet;
 
-pub(crate) use dto::{ArtifactDto, EventDto, PageDto, ProxyDto, RequestDto};
+pub(crate) use dto::{ArtifactDto, AuditDto, EventDto, PageDto, ProxyDto, RequestDto};
 pub(crate) use error::LogsError;
 use mesh_llm_log_store::{ArtifactRecord, LogStoreError, QuerySort, RequestRecord};
 
@@ -161,26 +161,36 @@ async fn handle_query(stream: &mut TcpStream, path: &str) -> anyhow::Result<()> 
         return LogsError::NotFound.write(stream).await;
     }
 
-    let state = crate::logging_runtime_state().ok_or(LogsError::ServiceUnavailable);
-    match (route, state) {
-        (Route::Requests, Ok(state)) => {
-            write_result(stream, list_requests(&state, path).await).await
+    let state = match crate::logging_runtime_state() {
+        Some(state) => state,
+        None => return LogsError::ServiceUnavailable.write(stream).await,
+    };
+    dispatch_query(stream, route, &state, path).await
+}
+
+async fn dispatch_query(
+    stream: &mut TcpStream,
+    route: Route,
+    state: &LoggingRuntimeState,
+    path: &str,
+) -> anyhow::Result<()> {
+    match route {
+        Route::Requests => write_result(stream, list_requests(state, path).await).await,
+        Route::RequestDetail(request_id) => {
+            write_result(stream, request_detail(state, &request_id).await).await
         }
-        (Route::RequestDetail(request_id), Ok(state)) => {
-            write_result(stream, request_detail(&state, &request_id).await).await
+        Route::RequestEvents(request_id) => {
+            write_result(stream, request_events(state, path, &request_id).await).await
         }
-        (Route::RequestEvents(request_id), Ok(state)) => {
-            write_result(stream, request_events(&state, path, &request_id).await).await
+        Route::RequestArtifacts(request_id) => {
+            write_result(stream, request_artifacts(state, path, &request_id).await).await
         }
-        (Route::RequestArtifacts(request_id), Ok(state)) => {
-            write_result(stream, request_artifacts(&state, path, &request_id).await).await
+        Route::Artifact(artifact_id) => {
+            write_result(stream, artifact_content(state, &artifact_id).await).await
         }
-        (Route::Artifact(artifact_id), Ok(state)) => {
-            write_result(stream, artifact_content(&state, &artifact_id).await).await
-        }
-        (Route::Proxy, Ok(state)) => write_result(stream, proxy_records(&state, path).await).await,
-        (Route::Unknown, _) => LogsError::NotFound.write(stream).await,
-        (_, Err(error)) => error.write(stream).await,
+        Route::Proxy => write_result(stream, proxy_records(state, path).await).await,
+        Route::Audit => write_result(stream, list_audits(state, path).await).await,
+        Route::Unknown => LogsError::NotFound.write(stream).await,
     }
 }
 
@@ -199,7 +209,11 @@ async fn handle_event_stream(
     let Some(bus) = state.replay_bus() else {
         return LogsError::ServiceUnavailable.write(stream).await;
     };
-    let recovery_cursor = event_recovery_cursor(&state).await;
+    let recovery_cursor = if subscription.is_audit() {
+        audit_recovery_cursor(&state).await
+    } else {
+        event_recovery_cursor(&state).await
+    };
     events::stream(stream, subscription, bus, recovery_cursor).await
 }
 
@@ -215,6 +229,24 @@ async fn event_recovery_cursor(state: &LoggingRuntimeState) -> Option<String> {
     Some(mesh_llm_log_store::encode_cursor(
         newest.created_at(),
         newest.request_id(),
+    ))
+}
+
+/// Best-effort recovery cursor for audit SSE. Points at the newest audit row
+/// so a reconnect can resume from the durable boundary.
+async fn audit_recovery_cursor(state: &LoggingRuntimeState) -> Option<String> {
+    let facade = state.query_facade()?;
+    let page = facade
+        .audit_entries(
+            Some(1),
+            None,
+            mesh_llm_log_store::AuditEntryFilters::default(),
+        )
+        .ok()?;
+    let newest = page.items.first()?;
+    Some(mesh_llm_log_store::encode_cursor(
+        &newest.occurred_at,
+        &newest.entry_id,
     ))
 }
 
@@ -235,6 +267,7 @@ enum Route {
     RequestArtifacts(String),
     Artifact(String),
     Proxy,
+    Audit,
     Unknown,
 }
 
@@ -242,7 +275,11 @@ impl Route {
     const fn accepts_query(&self) -> bool {
         matches!(
             self,
-            Self::Requests | Self::RequestEvents(_) | Self::RequestArtifacts(_) | Self::Proxy
+            Self::Requests
+                | Self::RequestEvents(_)
+                | Self::RequestArtifacts(_)
+                | Self::Proxy
+                | Self::Audit
         )
     }
 }
@@ -254,6 +291,9 @@ fn classify(path: &str) -> Route {
     }
     if path == "/api/logs/proxy" {
         return Route::Proxy;
+    }
+    if path == "/api/logs/audit" {
+        return Route::Audit;
     }
     if let Some(artifact_id) = path.strip_prefix("/api/logs/artifacts/")
         && !artifact_id.is_empty()
@@ -457,6 +497,25 @@ pub(crate) async fn proxy_records(
         let page = facade.proxy_records(&query)?;
         Ok(PageDto {
             items: page.items.into_iter().map(ProxyDto::from).collect(),
+            next_cursor: page.next_cursor,
+        })
+    })
+    .await
+}
+
+/// Parse and run `GET /api/logs/audit`. Operational audit rows are sparse,
+/// privacy-safe projections with no request IDs or detail payloads.
+pub(crate) async fn list_audits(
+    state: &LoggingRuntimeState,
+    path: &str,
+) -> Result<PageDto<AuditDto>, LogsError> {
+    let query = parse::audit_query(path)?;
+    let facade = state.query_facade().ok_or(LogsError::ServiceUnavailable)?;
+    run_blocking(move || {
+        let page =
+            facade.audit_entries(Some(query.limit), query.cursor.as_deref(), query.filters)?;
+        Ok(PageDto {
+            items: page.items.into_iter().map(AuditDto::from).collect(),
             next_cursor: page.next_cursor,
         })
     })
@@ -941,5 +1000,164 @@ mod tests {
         assert!(json.contains("admitted"));
         assert!(!json.contains("never-expose"));
         assert!(!json.contains("payload_json"));
+    }
+
+    #[tokio::test]
+    async fn audit_list_returns_sparse_dto_and_never_exposes_detail_json() {
+        let (_temp, state) = runtime();
+        let store = state.store().expect("store");
+        store
+            .insert_audit_entry(
+                "00000000-0000-4000-8000-000000000001",
+                None,
+                "2026-01-01T00:00:00Z",
+                "runtime",
+                "startup_complete",
+                Some(r#"{"severity":"info","secret":"SENTINEL-AUDIT-SECRET"}"#),
+            )
+            .expect("seed audit row");
+
+        let page = list_audits(&state, "/api/logs/audit?limit=10")
+            .await
+            .expect("list audits");
+        let json = serde_json::to_value(page).expect("serialize page");
+        let items = json["items"].as_array().expect("items");
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item["entryId"], "00000000-0000-4000-8000-000000000001");
+        assert_eq!(item["occurredAt"], "2026-01-01T00:00:00Z");
+        assert_eq!(item["source"], "runtime");
+        assert_eq!(item["code"], "startup_complete");
+        assert_eq!(item["severity"], "info");
+        assert!(!json.to_string().contains("SENTINEL-AUDIT-SECRET"));
+        assert!(!json.to_string().contains("requestId"));
+    }
+
+    #[tokio::test]
+    async fn audit_pagination_resumes_correctly_with_next_cursor() {
+        let (_temp, state) = runtime();
+        let store = state.store().expect("store");
+        for i in 1..=3 {
+            store
+                .insert_audit_entry(
+                    &format!("00000000-0000-4000-8000-00000000000{i}"),
+                    None,
+                    &format!("2026-01-01T00:00:0{i}Z"),
+                    "cli",
+                    &format!("action-{i}"),
+                    None,
+                )
+                .expect("seed audit row");
+        }
+
+        let first = list_audits(&state, "/api/logs/audit?limit=1")
+            .await
+            .expect("first page");
+        let first_json = serde_json::to_value(&first).expect("serialize first page");
+        let cursor = first.next_cursor.expect("has next cursor");
+        assert_eq!(first_json["items"].as_array().expect("items").len(), 1);
+
+        let second = list_audits(&state, &format!("/api/logs/audit?limit=1&cursor={cursor}"))
+            .await
+            .expect("second page");
+        let second_json = serde_json::to_value(&second).expect("serialize second page");
+        assert_eq!(second_json["items"].as_array().expect("items").len(), 1);
+        assert_ne!(
+            second_json["items"][0]["entryId"], first_json["items"][0]["entryId"],
+            "cursor should advance to a different row"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_filters_by_source() {
+        let (_temp, state) = runtime();
+        let store = state.store().expect("store");
+        store
+            .insert_audit_entry(
+                "00000000-0000-4000-8000-000000000010",
+                None,
+                "2026-01-01T00:00:00Z",
+                "mesh",
+                "peer_joined",
+                None,
+            )
+            .expect("seed mesh row");
+        store
+            .insert_audit_entry(
+                "00000000-0000-4000-8000-000000000011",
+                None,
+                "2026-01-01T00:00:01Z",
+                "runtime",
+                "startup_complete",
+                None,
+            )
+            .expect("seed runtime row");
+
+        let page = list_audits(&state, "/api/logs/audit?source=mesh&limit=10")
+            .await
+            .expect("filter by source");
+        let json = serde_json::to_value(page).expect("serialize page");
+        assert_eq!(json["items"].as_array().expect("items").len(), 1);
+        assert_eq!(json["items"][0]["source"], "mesh");
+    }
+
+    #[tokio::test]
+    async fn audit_filters_by_severity() {
+        let (_temp, state) = runtime();
+        let store = state.store().expect("store");
+        store
+            .insert_audit_entry(
+                "00000000-0000-4000-8000-000000000020",
+                None,
+                "2026-01-01T00:00:00Z",
+                "logging_service",
+                "health_check",
+                Some(r#"{"severity":"info"}"#),
+            )
+            .expect("seed info row");
+        store
+            .insert_audit_entry(
+                "00000000-0000-4000-8000-000000000021",
+                None,
+                "2026-01-01T00:00:01Z",
+                "logging_service",
+                "disk_pressure",
+                Some(r#"{"severity":"warning"}"#),
+            )
+            .expect("seed warning row");
+
+        let page = list_audits(&state, "/api/logs/audit?severity=warning&limit=10")
+            .await
+            .expect("filter by severity");
+        let json = serde_json::to_value(page).expect("serialize page");
+        assert_eq!(json["items"].as_array().expect("items").len(), 1);
+        assert_eq!(json["items"][0]["severity"], "warning");
+    }
+
+    #[tokio::test]
+    async fn audit_rejects_invalid_query_parameters() {
+        let (_temp, state) = runtime();
+
+        for path in [
+            "/api/logs/audit?limit=0",
+            "/api/logs/audit?limit=101",
+            "/api/logs/audit?limit=abc",
+            "/api/logs/audit?source=bogus",
+            "/api/logs/audit?severity=bogus",
+            "/api/logs/audit?cursor=garbage",
+            "/api/logs/audit?unknown=1",
+        ] {
+            let result = list_audits(&state, path).await;
+            assert!(result.is_err(), "expected error for invalid query: {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_unmatched_path_returns_not_found() {
+        assert!(matches!(classify("/api/logs/audit/extra"), Route::Unknown));
+        assert!(matches!(
+            classify("/api/logs/audit/sub/path"),
+            Route::Unknown
+        ));
     }
 }

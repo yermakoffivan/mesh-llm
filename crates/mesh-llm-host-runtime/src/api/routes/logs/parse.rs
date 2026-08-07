@@ -1,5 +1,8 @@
 use chrono::{DateTime, SecondsFormat, Utc};
-use mesh_llm_log_store::{PageQuery, ProxyQuery, QuerySort, RequestOutcome, RequestQuery};
+use mesh_llm_log_store::{
+    AuditEntryFilters, AuditEntrySeverity, AuditEntrySource, PageQuery, ProxyQuery, QuerySort,
+    RequestOutcome, RequestQuery,
+};
 use serde::Deserialize;
 
 use super::LogsError;
@@ -338,6 +341,54 @@ pub(super) fn proxy_query(path: &str) -> Result<ProxyQuery, LogsError> {
     Ok(query)
 }
 
+pub(super) struct AuditListQuery {
+    pub(super) limit: usize,
+    pub(super) cursor: Option<String>,
+    pub(super) filters: AuditEntryFilters,
+}
+
+pub(super) fn audit_query(path: &str) -> Result<AuditListQuery, LogsError> {
+    let mut parsed_limit = DEFAULT_LIMIT;
+    let mut cursor = None;
+    let mut filters = AuditEntryFilters::default();
+    for (key, value) in pairs(path)? {
+        match key.as_str() {
+            "limit" => parsed_limit = limit(&value)?,
+            "cursor" => cursor = Some(nonempty(value)?),
+            "source" => filters.source = Some(audit_source(&value)?),
+            "severity" => filters.severity = Some(audit_severity(&value)?),
+            _ => return Err(LogsError::InvalidQuery("unknown audit filter")),
+        }
+    }
+    if let Some(ref c) = cursor {
+        mesh_llm_log_store::decode_cursor(c).map_err(|_| LogsError::InvalidCursor)?;
+    }
+    Ok(AuditListQuery {
+        limit: parsed_limit,
+        cursor,
+        filters,
+    })
+}
+
+fn audit_source(value: &str) -> Result<AuditEntrySource, LogsError> {
+    match value {
+        "logging_service" => Ok(AuditEntrySource::LoggingService),
+        "runtime" => Ok(AuditEntrySource::Runtime),
+        "mesh" => Ok(AuditEntrySource::Mesh),
+        "cli" => Ok(AuditEntrySource::Cli),
+        _ => Err(LogsError::InvalidQuery("source is invalid")),
+    }
+}
+
+fn audit_severity(value: &str) -> Result<AuditEntrySeverity, LogsError> {
+    match value {
+        "info" => Ok(AuditEntrySeverity::Info),
+        "warning" => Ok(AuditEntrySeverity::Warning),
+        "error" => Ok(AuditEntrySeverity::Error),
+        _ => Err(LogsError::InvalidQuery("severity is invalid")),
+    }
+}
+
 pub(super) fn id(value: &str) -> Result<String, LogsError> {
     uuid::Uuid::parse_str(value)
         .map(|id| id.to_string())
@@ -605,6 +656,86 @@ mod tests {
                 "/api/logs/cleanup/run",
                 r#"{"operationId":"00000000-0000-4000-8000-000000000001","reason":""}"#
             ),
+            Err(LogsError::InvalidQuery(_))
+        ));
+    }
+
+    #[test]
+    fn audit_query_parses_valid_limit_source_severity_and_cursor() {
+        let query = audit_query("/api/logs/audit?limit=10&source=mesh&severity=warning")
+            .expect("parse audit query");
+        assert_eq!(query.limit, 10);
+        assert_eq!(query.filters.source, Some(AuditEntrySource::Mesh));
+        assert_eq!(query.filters.severity, Some(AuditEntrySeverity::Warning));
+        assert!(query.cursor.is_none());
+
+        let query = audit_query("/api/logs/audit").expect("parse bare audit query");
+        assert_eq!(query.limit, DEFAULT_LIMIT);
+        assert!(query.filters.source.is_none());
+        assert!(query.filters.severity.is_none());
+        assert!(query.cursor.is_none());
+    }
+
+    #[test]
+    fn audit_query_validates_cursor_normalization() {
+        let valid_cursor = mesh_llm_log_store::encode_cursor("2026-01-01T00:00:00Z", "some-uuid");
+        let query = audit_query(&format!("/api/logs/audit?cursor={valid_cursor}"))
+            .expect("parse with valid cursor");
+        assert_eq!(query.cursor.as_deref(), Some(valid_cursor.as_str()));
+    }
+
+    #[test]
+    fn audit_query_rejects_invalid_limit() {
+        assert!(matches!(
+            audit_query("/api/logs/audit?limit=0"),
+            Err(LogsError::InvalidQuery(_))
+        ));
+        assert!(matches!(
+            audit_query("/api/logs/audit?limit=101"),
+            Err(LogsError::InvalidQuery(_))
+        ));
+        assert!(matches!(
+            audit_query("/api/logs/audit?limit=abc"),
+            Err(LogsError::InvalidQuery(_))
+        ));
+    }
+
+    #[test]
+    fn audit_query_rejects_invalid_source() {
+        assert!(matches!(
+            audit_query("/api/logs/audit?source=bogus"),
+            Err(LogsError::InvalidQuery(_))
+        ));
+    }
+
+    #[test]
+    fn audit_query_rejects_invalid_severity() {
+        assert!(matches!(
+            audit_query("/api/logs/audit?severity=bogus"),
+            Err(LogsError::InvalidQuery(_))
+        ));
+    }
+
+    #[test]
+    fn audit_query_rejects_malformed_cursor() {
+        assert!(matches!(
+            audit_query("/api/logs/audit?cursor=garbage"),
+            Err(LogsError::InvalidCursor)
+        ));
+    }
+
+    #[test]
+    fn audit_query_rejects_duplicate_keys() {
+        assert!(matches!(
+            audit_query("/api/logs/audit?limit=1&limit=2"),
+            Err(LogsError::InvalidQuery(_))
+        ));
+    }
+
+    #[test]
+    fn audit_query_rejects_unknown_keys() {
+        assert!(matches!(
+            audit_query("/api/logs/audit?unknown=1"),
             Err(LogsError::InvalidQuery(_))
         ));
     }

@@ -62,6 +62,7 @@ struct ReplayBusState {
     /// queue must never consume the independently readable replay history.
     entries: VecDeque<BusEntry>,
     replay: ReplayHistory,
+    audit_replay: AuditReplayHistory,
 }
 
 /// Per-channel position carried by an SSE `id:` value. A vector cursor is
@@ -111,11 +112,85 @@ pub struct ReplayWindow {
     pub latest: ReplayCursor,
 }
 
+/// A replayable copy of an admitted operational audit entry. Audit entries
+/// use their own monotonic sequence, independent of the lifecycle channels.
+#[derive(Clone, Debug)]
+pub struct AuditReplayRecord {
+    pub entry: BusEntry,
+    pub sequence: u64,
+    pub cursor: u64,
+}
+
+/// Non-destructive snapshot of the bounded audit replay window.
+#[derive(Clone, Debug)]
+pub struct AuditReplayWindow {
+    pub records: Vec<AuditReplayRecord>,
+    /// Highest audit sequence that was evicted. A reconnect whose audit cursor
+    /// is behind this boundary must receive an audit replay-gap frame.
+    pub evicted_through: u64,
+    pub latest: u64,
+}
+
 #[derive(Debug)]
 struct ReplayHistory {
     records: VecDeque<ReplayRecord>,
     evicted_through: ReplayCursor,
     latest: ReplayCursor,
+}
+
+#[derive(Debug)]
+struct AuditReplayHistory {
+    records: VecDeque<AuditReplayRecord>,
+    evicted_through: u64,
+    latest: u64,
+}
+
+impl AuditReplayHistory {
+    fn new(capacity: usize) -> Self {
+        Self {
+            records: VecDeque::with_capacity(capacity),
+            evicted_through: 0,
+            latest: 0,
+        }
+    }
+
+    fn push(&mut self, capacity: usize, entry: BusEntry) -> bool {
+        let sequence = self.latest + 1;
+        let evicted = if self.records.len() >= capacity {
+            if let Some(record) = self.records.pop_front() {
+                self.evicted_through = self.evicted_through.max(record.sequence);
+            }
+            true
+        } else {
+            false
+        };
+        self.records.push_back(AuditReplayRecord {
+            entry,
+            sequence,
+            cursor: sequence,
+        });
+        self.latest = sequence;
+        evicted
+    }
+
+    fn trim_to(&mut self, capacity: usize) -> u64 {
+        let mut evicted = 0;
+        while self.records.len() > capacity {
+            if let Some(record) = self.records.pop_front() {
+                self.evicted_through = self.evicted_through.max(record.sequence);
+                evicted += 1;
+            }
+        }
+        evicted
+    }
+
+    fn snapshot(&self) -> AuditReplayWindow {
+        AuditReplayWindow {
+            records: self.records.iter().cloned().collect(),
+            evicted_through: self.evicted_through,
+            latest: self.latest,
+        }
+    }
 }
 
 impl ReplayHistory {
@@ -174,6 +249,7 @@ impl ReplayBus {
                 capacity,
                 entries: VecDeque::with_capacity(capacity),
                 replay: ReplayHistory::new(capacity),
+                audit_replay: AuditReplayHistory::new(capacity),
             }),
             notify: Notify::new(),
             updates,
@@ -203,6 +279,59 @@ impl ReplayBus {
         replay: ReplaySequence,
     ) -> PushOutcome {
         self.push_inner(payload, channel_hint, Some(replay))
+    }
+
+    /// Push an audit entry onto the bus and retain a copy in the audit replay
+    /// window. Uses an independent monotonic sequence (not ReplaySequence).
+    /// Mirrors the delivery-queue + notify + broadcast behavior of push_inner.
+    pub fn push_audit_replay(&self, payload: String, channel_hint: u8) -> PushOutcome {
+        let mut state = self.state.lock().expect("bus mutex poisoned");
+
+        if state.capacity == 0 {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+            drop(state);
+            self.metrics
+                .record(LoggingMetric::ReplayDropped { count: 1 });
+            return PushOutcome::Rejected;
+        }
+
+        let delivery_evicted = if state.entries.len() >= state.capacity {
+            state.entries.pop_front();
+            true
+        } else {
+            false
+        };
+
+        let entry = BusEntry {
+            payload,
+            channel_hint,
+        };
+        state.entries.push_back(entry.clone());
+        let capacity = state.capacity;
+        let audit_evicted = state.audit_replay.push(capacity, entry);
+        let outcome = if delivery_evicted || audit_evicted {
+            self.evictions.fetch_add(1, Ordering::Relaxed);
+            PushOutcome::EvictedOldest
+        } else {
+            PushOutcome::Enqueued
+        };
+        drop(state);
+        if matches!(outcome, PushOutcome::EvictedOldest) {
+            self.metrics
+                .record(LoggingMetric::ReplayEvicted { count: 1 });
+        }
+        self.notify.notify_one();
+        let _ = self.updates.send(());
+        outcome
+    }
+
+    /// Snapshot the audit replay history without consuming it.
+    pub fn audit_replay_window(&self) -> AuditReplayWindow {
+        self.state
+            .lock()
+            .expect("bus mutex poisoned")
+            .audit_replay
+            .snapshot()
     }
 
     fn push_inner(
@@ -298,7 +427,8 @@ impl ReplayBus {
             delivery_evicted += 1;
         }
         let replay_evicted = state.replay.trim_to(capacity);
-        let evicted = delivery_evicted.max(replay_evicted);
+        let audit_evicted = state.audit_replay.trim_to(capacity);
+        let evicted = delivery_evicted.max(replay_evicted).max(audit_evicted);
         if evicted != 0 {
             self.evictions.fetch_add(evicted, Ordering::Relaxed);
         }
@@ -508,5 +638,101 @@ mod tests {
 
         assert!(first.recv().await.is_ok());
         assert!(second.recv().await.is_ok());
+    }
+
+    #[test]
+    fn audit_window_retains_entries_in_order_with_monotonic_sequences() {
+        let bus = ReplayBus::new(3);
+        assert_eq!(
+            bus.push_audit_replay("audit-a".into(), 2),
+            PushOutcome::Enqueued
+        );
+        assert_eq!(
+            bus.push_audit_replay("audit-b".into(), 2),
+            PushOutcome::Enqueued
+        );
+        assert_eq!(
+            bus.push_audit_replay("audit-c".into(), 2),
+            PushOutcome::Enqueued
+        );
+
+        let window = bus.audit_replay_window();
+        assert_eq!(window.records.len(), 3);
+        assert_eq!(window.records[0].sequence, 1);
+        assert_eq!(window.records[0].cursor, 1);
+        assert_eq!(window.records[0].entry.payload, "audit-a");
+        assert_eq!(window.records[1].sequence, 2);
+        assert_eq!(window.records[2].sequence, 3);
+        assert_eq!(window.latest, 3);
+        assert_eq!(window.evicted_through, 0);
+    }
+
+    #[test]
+    fn audit_window_drop_oldest_eviction_advances_evicted_through() {
+        let bus = ReplayBus::new(2);
+        assert_eq!(
+            bus.push_audit_replay("old".into(), 2),
+            PushOutcome::Enqueued
+        );
+        assert_eq!(
+            bus.push_audit_replay("keep".into(), 2),
+            PushOutcome::Enqueued
+        );
+
+        // Push third → evicts "old" (sequence 1)
+        assert_eq!(
+            bus.push_audit_replay("new".into(), 2),
+            PushOutcome::EvictedOldest
+        );
+        assert_eq!(bus.evictions.load(Ordering::Relaxed), 1);
+
+        let window = bus.audit_replay_window();
+        assert_eq!(window.records.len(), 2);
+        assert_eq!(window.records[0].entry.payload, "keep");
+        assert_eq!(window.records[1].entry.payload, "new");
+        assert_eq!(window.evicted_through, 1);
+        assert_eq!(window.latest, 3);
+    }
+
+    #[test]
+    fn audit_window_survives_drain() {
+        let bus = ReplayBus::new(2);
+        bus.push_audit_replay("audit-1".into(), 2);
+        bus.push_audit_replay("audit-2".into(), 2);
+
+        assert_eq!(bus.drain().len(), 2);
+        assert!(bus.is_empty(), "delivery queue was consumed");
+
+        let window = bus.audit_replay_window();
+        assert_eq!(window.records.len(), 2, "audit replay remains readable");
+        assert_eq!(window.records[0].sequence, 1);
+        assert_eq!(window.records[1].sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn audit_updates_broadcast_to_subscribers() {
+        let bus = ReplayBus::new(1);
+        let mut first = bus.subscribe_updates();
+        let mut second = bus.subscribe_updates();
+        bus.push_audit_replay("audit-event".into(), 2);
+
+        assert!(first.recv().await.is_ok());
+        assert!(second.recv().await.is_ok());
+    }
+
+    #[test]
+    fn audit_zero_capacity_rejects_without_allocation() {
+        let bus = ReplayBus::new(0);
+        assert_eq!(
+            bus.push_audit_replay("audit".into(), 2),
+            PushOutcome::Rejected
+        );
+        assert_eq!(bus.len(), 0);
+        assert_eq!(bus.drops.load(Ordering::Relaxed), 1);
+        assert_eq!(bus.evictions.load(Ordering::Relaxed), 0);
+        let window = bus.audit_replay_window();
+        assert_eq!(window.records.len(), 0);
+        assert_eq!(window.evicted_through, 0);
+        assert_eq!(window.latest, 0);
     }
 }

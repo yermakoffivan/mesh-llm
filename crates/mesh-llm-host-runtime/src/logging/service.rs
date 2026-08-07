@@ -108,6 +108,8 @@ pub struct OperationalAuditRecord {
     code: &'static str,
     severity: Option<OperationalAuditSeverity>,
     detail_json: Option<String>,
+    entry_id: Option<String>,
+    occurred_at: Option<String>,
 }
 
 impl OperationalAuditRecord {
@@ -142,6 +144,26 @@ impl OperationalAuditRecord {
     pub(crate) fn detail_json(&self) -> Option<&str> {
         self.detail_json.as_deref()
     }
+
+    /// Attach a shared entry identity so the live bus frame and the durable
+    /// persistence row carry the same `entry_id` and `occurred_at`.
+    pub(crate) fn with_identity(mut self, entry_id: String, occurred_at: String) -> Self {
+        self.entry_id = Some(entry_id);
+        self.occurred_at = Some(occurred_at);
+        self
+    }
+
+    /// Shared entry identifier, present when the record was produced through
+    /// the live enqueue path. Absent for fallback audit records.
+    pub(crate) fn entry_id(&self) -> Option<&str> {
+        self.entry_id.as_deref()
+    }
+
+    /// Shared occurrence timestamp, present when the record was produced
+    /// through the live enqueue path. Absent for fallback audit records.
+    pub(crate) fn occurred_at(&self) -> Option<&str> {
+        self.occurred_at.as_deref()
+    }
 }
 
 /// Builder for static operational audit records.
@@ -164,6 +186,8 @@ impl OperationalAuditRecordBuilder {
             code: self.code,
             severity: self.severity,
             detail_json: None,
+            entry_id: None,
+            occurred_at: None,
         }
     }
 }
@@ -423,19 +447,29 @@ impl EventDelivery {
     }
 
     fn enqueue_audit(&self, record: OperationalAuditRecord) {
+        let entry_id = EventId::new().as_uuid().to_string();
+        let occurred_at = self.clock.now();
+        let record = record.with_identity(entry_id.clone(), occurred_at.clone());
+        let mut payload = serde_json::json!({
+            "kind": "audit",
+            "entry_id": entry_id,
+            "occurred_at": occurred_at,
+            "source": record.source(),
+            "code": record.code(),
+        });
+        if let Some(severity) = record.severity() {
+            payload
+                .as_object_mut()
+                .expect("audit payload is always an object")
+                .insert("severity".into(), serde_json::json!(severity.as_str()));
+        }
         let entry = BusEntry {
-            payload: serde_json::json!({
-                "kind": "audit",
-                "source": record.source(),
-                "code": record.code(),
-                "severity": record.severity().map(OperationalAuditSeverity::as_str),
-            })
-            .to_string(),
+            payload: payload.to_string(),
             channel_hint: 2,
         };
         let outcome = self
             .bus
-            .push_with_hint(entry.payload.clone(), entry.channel_hint);
+            .push_audit_replay(entry.payload.clone(), entry.channel_hint);
         if self.sink_enabled && !matches!(outcome, super::bus::PushOutcome::Rejected) {
             offer_persistence_to(
                 &self.delivery,

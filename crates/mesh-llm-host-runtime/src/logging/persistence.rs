@@ -238,8 +238,14 @@ impl PersistSink for LogStoreSink {
     }
 
     async fn persist_audit_entry(&self, record: OperationalAuditRecord) -> Result<(), String> {
-        let entry_id = EventId::new().as_uuid().to_string();
-        let occurred_at = self.store.now();
+        let entry_id = record
+            .entry_id()
+            .map(str::to_owned)
+            .unwrap_or_else(|| EventId::new().as_uuid().to_string());
+        let occurred_at = record
+            .occurred_at()
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.store.now());
         let detail_json = if let Some(detail_json) = record.detail_json() {
             Some(detail_json.to_string())
         } else {

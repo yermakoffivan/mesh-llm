@@ -47,8 +47,9 @@ pub use query::{
 };
 pub use repositories::{
     AuditEntryFilters, AuditEntryRow, AuditEntrySeverity, AuditEntrySource, CascadeArtifactPointer,
-    DEFAULT_AUDIT_ENTRY_LIMIT, MAX_AUDIT_ENTRY_LIMIT, RetentionCleanupResult, RetentionPolicy,
-    RetentionTable, RetentionTablePolicy, RetentionTableResult, WebhookDeliveryErrorCode,
-    WebhookDeliveryInsertOutcome, WebhookDeliveryRecord, WebhookDeliveryState, WebhookRetryOutcome,
+    DEFAULT_AUDIT_ENTRY_LIMIT, MAX_AUDIT_ENTRY_LIMIT, Page, RetentionCleanupResult,
+    RetentionPolicy, RetentionTable, RetentionTablePolicy, RetentionTableResult,
+    WebhookDeliveryErrorCode, WebhookDeliveryInsertOutcome, WebhookDeliveryRecord,
+    WebhookDeliveryState, WebhookRetryOutcome,
 };
 pub use store::{Clock, LogStore, SystemClock as RealClock};

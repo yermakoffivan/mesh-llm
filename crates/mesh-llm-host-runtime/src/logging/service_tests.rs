@@ -41,6 +41,8 @@ enum TestRecord {
     AuditEntry {
         level: String,
         message: String,
+        entry_id: Option<String>,
+        occurred_at: Option<String>,
     },
     WebhookDelivery {
         request_id: Option<String>,
@@ -212,6 +214,8 @@ impl PersistSink for TestSink {
                 .detail_json()
                 .unwrap_or_else(|| record.code())
                 .to_string(),
+            entry_id: record.entry_id().map(str::to_owned),
+            occurred_at: record.occurred_at().map(str::to_owned),
         });
         Ok(())
     }
@@ -2023,4 +2027,66 @@ fn test_drop_oldest_preserves_recent() {
     assert_eq!(entries[2].payload, "entry_9");
 
     // Oldest entries (0-6) were evicted.
+}
+
+// ---------------------------------------------------------------------------
+// Audit identity sharing: live bus frame and durable row share entry_id/occurred_at
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn audit_enqueue_shares_identity_with_durable_row() {
+    let sink = Arc::new(TestSink::new());
+    let service = LoggingService::new(
+        ServiceConfig::default(),
+        Arc::clone(&sink) as Arc<dyn PersistSink>,
+        Box::new(TestClock::new()),
+    );
+
+    let record = OperationalAuditRecord::builder("runtime", "startup_complete").build();
+    assert!(service.write_operational_audit(record));
+
+    assert_eq!(service.pump_sync().await, 1);
+
+    let audit_records: Vec<_> = sink
+        .records()
+        .into_iter()
+        .filter_map(|r| match r {
+            TestRecord::AuditEntry {
+                level,
+                message,
+                entry_id,
+                occurred_at,
+            } => Some((level, message, entry_id, occurred_at)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(audit_records.len(), 1);
+    let (durable_level, durable_message, durable_entry_id, durable_occurred_at) = &audit_records[0];
+
+    let bus_entries = service.bus_ref().audit_replay_window();
+    assert_eq!(bus_entries.records.len(), 1);
+    let live_payload: serde_json::Value =
+        serde_json::from_str(&bus_entries.records[0].entry.payload).expect("parse live payload");
+    let live_entry_id = live_payload
+        .get("entry_id")
+        .and_then(|v| v.as_str())
+        .expect("entry_id");
+    let live_occurred_at = live_payload
+        .get("occurred_at")
+        .and_then(|v| v.as_str())
+        .expect("occurred_at");
+
+    assert!(!live_entry_id.is_empty());
+    assert!(!live_occurred_at.is_empty());
+    assert_eq!(
+        live_payload.get("source").and_then(|v| v.as_str()),
+        Some("runtime")
+    );
+    assert_eq!(
+        live_payload.get("code").and_then(|v| v.as_str()),
+        Some("startup_complete")
+    );
+
+    assert_eq!(durable_entry_id.as_deref(), Some(live_entry_id));
+    assert_eq!(durable_occurred_at.as_deref(), Some(live_occurred_at));
 }
