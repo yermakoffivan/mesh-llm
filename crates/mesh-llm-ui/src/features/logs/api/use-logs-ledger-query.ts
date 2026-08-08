@@ -14,6 +14,6 @@ export function useLogsLedgerQuery(search: LogsLedgerSearch) {
   return useQuery({
     queryKey: logsKeys.ledger(search, dataMode.mode),
     queryFn: () => new LogsApiClient().listRequests(toLogsRequestQuery(search), dataMode.mode as DataMode),
-    staleTime: 10_000,
+    staleTime: 10_000
   })
 }

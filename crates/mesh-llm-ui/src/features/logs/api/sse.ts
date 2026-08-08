@@ -1,5 +1,13 @@
 import { LogAuditCursor, LogReplayCursor, LogRequestId, type LogReplayChannel } from './ids'
-import { LogsDtoError, parseReplayEvent, parseReplayGap, parseAuditEntry, parseAuditGap, type ParsedReplayEvent, type ParsedReplayGap } from './schemas'
+import {
+  LogsDtoError,
+  parseReplayEvent,
+  parseReplayGap,
+  parseAuditEntry,
+  parseAuditGap,
+  type ParsedReplayEvent,
+  type ParsedReplayGap
+} from './schemas'
 
 export type LogsSseFilterKey = 'from' | 'to' | 'route' | 'model' | 'provider' | 'engine' | 'outcome'
 
@@ -24,8 +32,25 @@ export type LogsSseFrame =
   | { readonly type: 'log_event'; readonly cursor: LogReplayCursor; readonly event: ParsedReplayEvent }
   | { readonly type: 'replay_gap'; readonly cursor: LogReplayCursor; readonly gap: ParsedReplayGap }
   | { readonly type: 'stream_error'; readonly cursor: LogReplayCursor; readonly code: 'invalid_event' }
-  | { readonly type: 'audit_entry'; readonly cursor: LogAuditCursor; readonly entry: { readonly entryId: string; readonly occurredAt: string; readonly source: string; readonly code: string; readonly severity?: string; readonly sequence: number } }
-  | { readonly type: 'audit_gap'; readonly cursor: LogAuditCursor; readonly fromSequence: number; readonly toSequence: number; readonly recoveryCursor?: string }
+  | {
+      readonly type: 'audit_entry'
+      readonly cursor: LogAuditCursor
+      readonly entry: {
+        readonly entryId: string
+        readonly occurredAt: string
+        readonly source: string
+        readonly code: string
+        readonly severity?: string
+        readonly sequence: number
+      }
+    }
+  | {
+      readonly type: 'audit_gap'
+      readonly cursor: LogAuditCursor
+      readonly fromSequence: number
+      readonly toSequence: number
+      readonly recoveryCursor?: string
+    }
 
 export type LogsSseFrameInput = {
   readonly event: string
@@ -77,7 +102,13 @@ export function parseLogsSseFrame(input: LogsSseFrameInput): LogsSseFrame {
     case 'audit_gap': {
       const cursor = LogAuditCursor.parse(input.lastEventId)
       const gap = parseAuditGap(data)
-      return { type: 'audit_gap', cursor, fromSequence: gap.fromSequence, toSequence: gap.toSequence, recoveryCursor: gap.recovery.cursor ?? undefined }
+      return {
+        type: 'audit_gap',
+        cursor,
+        fromSequence: gap.fromSequence,
+        toSequence: gap.toSequence,
+        recoveryCursor: gap.recovery.cursor ?? undefined
+      }
     }
     default:
       throw new LogsDtoError()

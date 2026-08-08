@@ -5,10 +5,30 @@ import type { LogRequestId } from '@/features/logs/api/ids'
 
 export const logRequestDetailsKeys = {
   all: ['logs', 'request-details'],
-  summary: (requestId: LogRequestId, mode: DataMode) => [...logRequestDetailsKeys.all, 'summary', requestId.toString(), mode],
-  events: (requestId: LogRequestId, mode: DataMode) => [...logRequestDetailsKeys.all, 'events', requestId.toString(), mode],
-  artifacts: (requestId: LogRequestId, mode: DataMode) => [...logRequestDetailsKeys.all, 'artifacts', requestId.toString(), mode],
-  attempts: (requestId: LogRequestId, mode: DataMode) => [...logRequestDetailsKeys.all, 'attempts', requestId.toString(), mode]
+  summary: (requestId: LogRequestId, mode: DataMode) => [
+    ...logRequestDetailsKeys.all,
+    'summary',
+    requestId.toString(),
+    mode
+  ],
+  events: (requestId: LogRequestId, mode: DataMode) => [
+    ...logRequestDetailsKeys.all,
+    'events',
+    requestId.toString(),
+    mode
+  ],
+  artifacts: (requestId: LogRequestId, mode: DataMode) => [
+    ...logRequestDetailsKeys.all,
+    'artifacts',
+    requestId.toString(),
+    mode
+  ],
+  attempts: (requestId: LogRequestId, mode: DataMode) => [
+    ...logRequestDetailsKeys.all,
+    'attempts',
+    requestId.toString(),
+    mode
+  ]
 }
 
 export function useLogRequestSummaryQuery(requestId: LogRequestId) {

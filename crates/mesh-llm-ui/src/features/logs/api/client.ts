@@ -1,15 +1,12 @@
 import { env } from '@/lib/env'
 
-
-
 import type { DataMode } from '@/lib/data-mode'
-import { HARNESS_LOG_FIXTURES, generateLifecycleEvents, generateArtifacts, generateProxyAttempts } from '../lib/log-fixtures'
-
- 
- 
-
-
-
+import {
+  HARNESS_LOG_FIXTURES,
+  generateLifecycleEvents,
+  generateArtifacts,
+  generateProxyAttempts
+} from '../lib/log-fixtures'
 
 import { LogArtifactId, LogOperationId, LogPageCursor, LogRequestId, LogWebhookDeliveryId } from './ids'
 import {
@@ -242,10 +239,15 @@ function filterHarnessRequests(items: readonly LogRequest[], query: LogsRequestQ
   })
 }
 
-function paginateHarnessRequests(items: readonly LogRequest[], cursor?: number, limit = HARNESS_PAGE_SIZE): LogsPage<LogRequest> {
+function paginateHarnessRequests(
+  items: readonly LogRequest[],
+  cursor?: number,
+  limit = HARNESS_PAGE_SIZE
+): LogsPage<LogRequest> {
   const startIndex = Math.max(0, Number(cursor ?? 0))
   const sliced = items.slice(startIndex, startIndex + limit)
-  const nextCursor = startIndex + sliced.length < items.length ? LogPageCursor.parse((startIndex + sliced.length).toString()) : undefined
+  const nextCursor =
+    startIndex + sliced.length < items.length ? LogPageCursor.parse((startIndex + sliced.length).toString()) : undefined
   return { items: sliced, nextCursor }
 }
 
@@ -256,7 +258,10 @@ export class LogsApiClient {
     this.#fetch = fetchFunction ?? fetch.bind(globalThis)
   }
 
-  async listRequests(query: LogsRequestQuery = {}, mode: DataMode = 'live'): Promise<LogsCapability<LogsPage<LogRequest>>> {
+  async listRequests(
+    query: LogsRequestQuery = {},
+    mode: DataMode = 'live'
+  ): Promise<LogsCapability<LogsPage<LogRequest>>> {
     if (mode === 'harness') {
       const filtered = filterHarnessRequests(HARNESS_LOG_FIXTURES, query)
       const harnessCursor = query.cursor ? Number(query.cursor.toString()) : undefined
@@ -272,7 +277,7 @@ export class LogsApiClient {
   }
   async getRequest(requestId: LogRequestId, mode: DataMode = 'live'): Promise<LogRequest> {
     if (mode === 'harness') {
-      const fixture = HARNESS_LOG_FIXTURES.find(f => f.requestId.toString() === requestId.toString())
+      const fixture = HARNESS_LOG_FIXTURES.find((f) => f.requestId.toString() === requestId.toString())
       if (!fixture) throw new LogsApiError(404, 'not_found')
       return fixture as LogRequest
     }
