@@ -886,6 +886,7 @@ fn text_auto_request() -> BufferedHttpRequest {
         stream: None,
         request_object_request_ids: Vec::new(),
         response_adapter: ResponseAdapter::None,
+        correlation_id: None,
     }
 }
 fn large_tokenize_request(model: &str) -> BufferedHttpRequest {
@@ -904,6 +905,7 @@ fn large_tokenize_request(model: &str) -> BufferedHttpRequest {
         stream: None,
         request_object_request_ids: Vec::new(),
         response_adapter: ResponseAdapter::None,
+        correlation_id: None,
     }
 }
 fn local_gguf_descriptor(model_name: &str) -> mesh::ServedModelDescriptor {
@@ -1119,6 +1121,7 @@ fn test_capture_path_for_request_uses_client_path() {
         model_name: Some("qwen".to_string()),
         request_object_request_ids: Vec::new(),
         response_adapter: ResponseAdapter::OpenAiResponsesStream,
+        correlation_id: None,
     };
 
     assert_eq!(capture_path_for_request(&request), "/v1/responses?foo=1");

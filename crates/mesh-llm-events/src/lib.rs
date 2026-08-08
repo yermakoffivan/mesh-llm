@@ -12,8 +12,8 @@ pub mod logging;
 pub mod terminal_progress;
 
 mod command_lifecycle;
-pub use command_lifecycle::{CliCommandFamily, CliCommandOutcome, emit_cli_command_event};
 pub use audit::*;
+pub use command_lifecycle::{CliCommandFamily, CliCommandOutcome, emit_cli_command_event};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum LogFormat {

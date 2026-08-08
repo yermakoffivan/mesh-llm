@@ -6,6 +6,7 @@ use crate::network::affinity;
 use crate::network::openai::auto_route;
 use crate::network::openai::transport as proxy;
 use crate::network::router;
+use mesh_llm_events::audit::{audit_events, emit_audit};
 use mesh_llm_events::{OutputEvent, emit_event};
 use mesh_llm_node::serving::{UnloadOptions, UnloadTarget};
 use mesh_mixture_of_agents as moa;
@@ -943,6 +944,15 @@ async fn handle_buffered_api_request(
         )
         .await
     };
+    if let Some(model) = decision.effective_model.as_deref()
+        && !request.is_tokenize_request()
+    {
+        let mut event = audit_events::model_access(None, model, "route", true);
+        if let Some(cid) = request.correlation_id.as_deref() {
+            event = event.with_metadata("request_id", serde_json::Value::String(cid.to_string()));
+        }
+        let _ = emit_audit(event);
+    }
     proxy::release_request_objects(ctx.route.node, &request.request_object_request_ids).await;
     lifecycle.terminal(terminal_outcome_for_plugin_route(plugin_outcome));
 }
@@ -1130,6 +1140,7 @@ mod tests {
             model_name: Some(model.to_owned()),
             request_object_request_ids: Vec::new(),
             response_adapter: proxy::ResponseAdapter::None,
+            correlation_id: None,
         }
     }
 

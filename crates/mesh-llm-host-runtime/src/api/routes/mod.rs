@@ -52,6 +52,10 @@ pub(super) const DISPATCH_REQUEST: DispatchRequestFn =
                     diagnostics::handle(stream, state, path).await?;
                     Ok(true)
                 }
+                ("GET", "/api/diagnostics") => {
+                    diagnostics::handle(stream, state, path).await?;
+                    Ok(true)
+                }
                 ("GET" | "POST" | "DELETE", "/mcp") => {
                     mcp::handle(stream, state, raw_request).await?;
                     Ok(true)
