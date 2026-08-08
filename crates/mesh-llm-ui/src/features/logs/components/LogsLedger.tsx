@@ -242,9 +242,7 @@ function KpiTile({
         strokeWidth={1.5}
         ariaLabel={sparklineLabel}
       />
-      {secondaryLabel ? (
-        <div className="mt-1 type-caption text-fg-dim">{secondaryLabel}</div>
-      ) : null}
+      {secondaryLabel ? <div className="mt-1 type-caption text-fg-dim">{secondaryLabel}</div> : null}
     </div>
   )
 }
@@ -326,12 +324,7 @@ function TableCapture({ table, onCapture }: TableCaptureProps) {
 /* LogsLedger                                                          */
 /* ------------------------------------------------------------------ */
 
-export function LogsLedger({
-  search,
-  onSearchChange,
-  onRequestOpen,
-  onMaintenanceMutationSucceeded
-}: LogsLedgerProps) {
+export function LogsLedger({ search, onSearchChange, onRequestOpen, onMaintenanceMutationSucceeded }: LogsLedgerProps) {
   const query = useLogsLedgerQuery(search)
   const { refetch } = query
   const result = query.data
@@ -377,7 +370,6 @@ export function LogsLedger({
   useEffect(() => {
     if (!search.focusRequestId) return
     document.getElementById(`log-request-${search.focusRequestId}`)?.focus()
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- rows dep ensures the target row is mounted before focusing
   }, [rows, search.focusRequestId])
 
   return (
@@ -386,8 +378,13 @@ export function LogsLedger({
       aria-labelledby="logs-ledger-title"
     >
       <header className="border-b border-border-soft pb-[var(--panel-y)]">
-        <div className="flex min-h-[58px] flex-wrap items-center justify-between gap-x-4 gap-y-2 py-0" aria-live="polite">
-          <h1 className="type-headline text-foreground" id="logs-ledger-title">Request logs</h1>
+        <div
+          className="flex min-h-[58px] flex-wrap items-center justify-between gap-x-4 gap-y-2 py-0"
+          aria-live="polite"
+        >
+          <h1 className="type-headline text-foreground" id="logs-ledger-title">
+            Request logs
+          </h1>
           <div className="flex flex-wrap items-center gap-2">
             {result?.state === 'supported' ? (
               <StatusBadge dot size="caption" tone={query.isFetching ? 'accent' : liveStateTone(live.state)}>
@@ -459,9 +456,7 @@ export function LogsLedger({
           <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border-soft px-4 py-3">
             <p className="type-caption min-w-0 truncate font-mono text-fg-faint">
               <span className="text-fg-dim">
-                {visibleRows.length === rows.length
-                  ? visibleRows.length
-                  : `${visibleRows.length} of ${rows.length}`}
+                {visibleRows.length === rows.length ? visibleRows.length : `${visibleRows.length} of ${rows.length}`}
               </span>{' '}
               requests
             </p>
