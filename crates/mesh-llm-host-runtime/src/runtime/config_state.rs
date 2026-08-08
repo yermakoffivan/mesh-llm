@@ -529,6 +529,7 @@ mod tests {
             mesh_requirements: Default::default(),
             owner_control: Default::default(),
             telemetry: Default::default(),
+            audit: Default::default(),
             defaults: None,
             runtime: Default::default(),
             models: vec![],
@@ -969,6 +970,7 @@ reasoning_format = "qwen"
             mesh_requirements: Default::default(),
             owner_control: Default::default(),
             telemetry: Default::default(),
+            audit: Default::default(),
             defaults: None,
             runtime: Default::default(),
             models: vec![crate::plugin::ModelConfigEntry {
@@ -1016,6 +1018,7 @@ reasoning_format = "qwen"
             mesh_requirements: Default::default(),
             owner_control: Default::default(),
             telemetry: Default::default(),
+            audit: Default::default(),
             defaults: None,
             runtime: Default::default(),
             models: vec![crate::plugin::ModelConfigEntry {
@@ -1394,6 +1397,7 @@ temperature = 0.2
             mesh_requirements: Default::default(),
             owner_control: Default::default(),
             telemetry: Default::default(),
+            audit: Default::default(),
             defaults: None,
             runtime: Default::default(),
             models: vec![crate::plugin::ModelConfigEntry {
