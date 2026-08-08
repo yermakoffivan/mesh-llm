@@ -573,78 +573,78 @@ export function LogRequestDeleteControl({ requestId, onMaintenanceMutationSuccee
           <Trash2 className="size-3.5" aria-hidden="true" />
           Delete terminal request
         </Button>
-      <SharedModal open={open} onOpenChange={setOpen}>
-        <SharedModalContent
-          onCloseAutoFocus={(event) => {
-            if (!triggerRef.current) return
-            event.preventDefault()
-            triggerRef.current.focus()
-          }}
-        >
-          <SharedModalHeader>
-            <SharedModalTitle>Delete terminal request?</SharedModalTitle>
-            <SharedModalDescription>
-              This removes the selected durable request and its retained child records. Review and confirm with an audit
-              reason.
-            </SharedModalDescription>
-          </SharedModalHeader>
-          <SharedModalBody className="space-y-3">
-            <code className="block break-all font-mono text-[length:var(--density-type-caption)] text-fg-dim">
-              {requestId.toString()}
-            </code>
-            {!receipt ? (
-              <label
-                className="grid gap-1.5 text-[length:var(--density-type-caption)] text-fg-dim"
-                htmlFor="log-delete-reason"
-              >
-                <span className="type-label text-fg-faint">Required audit reason</span>
-                <Input
-                  id="log-delete-reason"
-                  onChange={(event) => setReason(event.currentTarget.value)}
-                  placeholder="Why remove this request?"
-                  value={reason}
-                />
-              </label>
-            ) : null}
-            {receipt ? <ReceiptDiagnostics receipt={receipt} /> : null}
-            {action ? (
-              <p className={`type-caption ${action.tone === 'error' ? 'text-bad' : 'text-good'}`} role="status">
-                {action.message}
-              </p>
-            ) : null}
-          </SharedModalBody>
-          <SharedModalActionStrip>
-            <DialogPrimitive.Close asChild>
-              <Button className="ui-control" size="sm" type="button" variant="outline">
-                Cancel
-              </Button>
-            </DialogPrimitive.Close>
-            {!receipt ? (
-              <Button
-                className="ui-control-destructive"
-                disabled={!isReasonValid(reason) || pending}
-                onClick={() => void deleteRequest()}
-                size="sm"
-                type="button"
-                variant="outline"
-              >
-                {pending ? 'Deleting…' : 'Confirm deletion'}
-              </Button>
-            ) : hasRetryableArtifactWork(receipt) ? (
-              <Button
-                className="ui-control-destructive"
-                disabled={!operation || pending}
-                onClick={() => void retryDeletion()}
-                size="sm"
-                type="button"
-                variant="outline"
-              >
-                {pending ? 'Retrying…' : 'Retry deletion'}
-              </Button>
-            ) : null}
-          </SharedModalActionStrip>
-        </SharedModalContent>
-      </SharedModal>
+        <SharedModal open={open} onOpenChange={setOpen}>
+          <SharedModalContent
+            onCloseAutoFocus={(event) => {
+              if (!triggerRef.current) return
+              event.preventDefault()
+              triggerRef.current.focus()
+            }}
+          >
+            <SharedModalHeader>
+              <SharedModalTitle>Delete terminal request?</SharedModalTitle>
+              <SharedModalDescription>
+                This removes the selected durable request and its retained child records. Review and confirm with an
+                audit reason.
+              </SharedModalDescription>
+            </SharedModalHeader>
+            <SharedModalBody className="space-y-3">
+              <code className="block break-all font-mono text-[length:var(--density-type-caption)] text-fg-dim">
+                {requestId.toString()}
+              </code>
+              {!receipt ? (
+                <label
+                  className="grid gap-1.5 text-[length:var(--density-type-caption)] text-fg-dim"
+                  htmlFor="log-delete-reason"
+                >
+                  <span className="type-label text-fg-faint">Required audit reason</span>
+                  <Input
+                    id="log-delete-reason"
+                    onChange={(event) => setReason(event.currentTarget.value)}
+                    placeholder="Why remove this request?"
+                    value={reason}
+                  />
+                </label>
+              ) : null}
+              {receipt ? <ReceiptDiagnostics receipt={receipt} /> : null}
+              {action ? (
+                <p className={`type-caption ${action.tone === 'error' ? 'text-bad' : 'text-good'}`} role="status">
+                  {action.message}
+                </p>
+              ) : null}
+            </SharedModalBody>
+            <SharedModalActionStrip>
+              <DialogPrimitive.Close asChild>
+                <Button className="ui-control" size="sm" type="button" variant="outline">
+                  Cancel
+                </Button>
+              </DialogPrimitive.Close>
+              {!receipt ? (
+                <Button
+                  className="ui-control-destructive"
+                  disabled={!isReasonValid(reason) || pending}
+                  onClick={() => void deleteRequest()}
+                  size="sm"
+                  type="button"
+                  variant="outline"
+                >
+                  {pending ? 'Deleting…' : 'Confirm deletion'}
+                </Button>
+              ) : hasRetryableArtifactWork(receipt) ? (
+                <Button
+                  className="ui-control-destructive"
+                  disabled={!operation || pending}
+                  onClick={() => void retryDeletion()}
+                  size="sm"
+                  type="button"
+                  variant="outline"
+                >
+                  {pending ? 'Retrying…' : 'Retry deletion'}
+                </Button>
+              ) : null}
+            </SharedModalActionStrip>
+          </SharedModalContent>
+        </SharedModal>
       </div>
     </div>
   )
