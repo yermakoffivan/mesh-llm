@@ -8,6 +8,7 @@ export type ConfigurationTabId =
   | 'signing'
   | 'plugins'
   | 'toml-review'
+  | 'audit'
 
 export const CONFIGURATION_TAB_IDS = [
   'general',
@@ -18,7 +19,8 @@ export const CONFIGURATION_TAB_IDS = [
   'wake-policy',
   'signing',
   'plugins',
-  'toml-review'
+  'toml-review',
+  'audit'
 ] as const satisfies readonly ConfigurationTabId[]
 
 type ConfigurationTabAvailability = {

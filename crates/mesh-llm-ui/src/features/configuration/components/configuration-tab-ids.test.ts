@@ -12,7 +12,7 @@ describe('configuration-tab-ids', () => {
         signingAttestationEnabled: false,
         wakePolicyEnabled: false
       })
-    ).toEqual(['general', 'runtime', 'models', 'network', 'local-deployment', 'toml-review'])
+    ).toEqual(['general', 'runtime', 'models', 'network', 'local-deployment', 'toml-review', 'audit'])
   })
 
   it('treats the Reserves tab as invalid when its feature flag is disabled', () => {

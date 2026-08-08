@@ -1,5 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { AlertTriangle, Blocks, Brackets, Computer, Cpu, Network, ShieldCheck, SlidersHorizontal } from 'lucide-react'
+import {
+  AlertTriangle,
+  Blocks,
+  Brackets,
+  Computer,
+  Cpu,
+  FileText,
+  Network,
+  ShieldCheck,
+  SlidersHorizontal
+} from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { CatalogPopover } from '@/features/configuration/components/CatalogPopover'
@@ -138,6 +148,7 @@ export function ConfigurationPageContent({
   if (
     liveData.defaults.settings.length === 0 &&
     (liveData.meshllm?.settings.length ?? 0) === 0 &&
+    (liveData.audit?.settings.length ?? 0) === 0 &&
     (liveData.runtimeSettings?.settings.length ?? 0) === 0 &&
     (liveData.network?.settings.length ?? 0) === 0 &&
     (livePluginSettingsData?.settings.length ?? 0) === 0
@@ -202,6 +213,7 @@ function ConfigurationEditorPage({
       createDefaultsValues(
         displayData.defaults,
         displayData.meshllm,
+        displayData.audit,
         displayData.runtimeSettings,
         displayData.modelSettings,
         displayData.network,
@@ -210,6 +222,7 @@ function ConfigurationEditorPage({
       ),
     [
       displayData.attestation,
+      displayData.audit,
       displayData.defaults,
       displayData.meshllm,
       displayData.modelSettings,
@@ -400,6 +413,7 @@ function ConfigurationEditorPage({
   const modelSettingsDirty = settingsDirty(modelSettingsData)
   const networkDirty = settingsDirty(displayData.network)
   const attestationDirty = settingsDirty(displayData.attestation)
+  const auditDirty = settingsDirty(displayData.audit)
   const pluginsDirty = settingsDirty(pluginsSettingsData)
   const localDeploymentDirty = useMemo(
     () =>
@@ -643,6 +657,7 @@ function ConfigurationEditorPage({
     () =>
       combineSettingsData(
         displayData.meshllm,
+        displayData.audit,
         displayData.runtimeSettings,
         modelSettingsData,
         displayData.network,
@@ -651,6 +666,7 @@ function ConfigurationEditorPage({
       ),
     [
       displayData.attestation,
+      displayData.audit,
       displayData.meshllm,
       displayData.network,
       displayData.runtimeSettings,
@@ -841,6 +857,36 @@ function ConfigurationEditorPage({
       ) : (
         <ConfigurationPlaceholderPanel title="Network settings" icon={Network}>
           No writable network settings are exposed by the current runtime schema.
+        </ConfigurationPlaceholderPanel>
+      )
+    },
+    {
+      id: 'audit',
+      label: 'Audit Logging',
+      icon: FileText,
+      dirty: auditDirty,
+      content: displayData.audit?.settings.length ? (
+        <DefaultsTab
+          data={displayData.audit}
+          values={defaultsValues}
+          onResetAll={() => resetSettings(displayData.audit)}
+          onSettingValueChange={updateDefaultSetting}
+          configFilePath={displayData.configFilePath}
+          readOnlyNotice={runtimeControlNotice}
+          previewTitle="[audit]"
+          screenLabel="Configuration · audit"
+          summaryDescription={
+            <>
+              Audit logging settings control security event recording. Configure log path, format, level, and rotation
+              policy. Written to config.toml under the [audit] section.
+            </>
+          }
+          summaryTitle="Audit logging"
+          summaryTitleId="audit-summary-heading"
+        />
+      ) : (
+        <ConfigurationPlaceholderPanel title="Audit logging" icon={FileText}>
+          No writable audit logging settings are exposed by the current runtime schema.
         </ConfigurationPlaceholderPanel>
       )
     },
