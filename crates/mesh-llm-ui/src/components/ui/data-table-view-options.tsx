@@ -18,7 +18,11 @@ export function DataTableViewOptions<TData>({ table }: DataTableViewOptionsProps
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button className="ui-control h-8 gap-1.5 rounded-[var(--radius)] px-2.5 text-[length:var(--density-type-caption)]" size="sm" variant="outline">
+        <Button
+          className="ui-control h-8 gap-1.5 rounded-[var(--radius)] px-2.5 text-[length:var(--density-type-caption)]"
+          size="sm"
+          variant="outline"
+        >
           <Columns3 className="size-3.5" aria-hidden="true" />
           Columns
         </Button>
