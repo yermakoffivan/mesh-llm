@@ -77,6 +77,7 @@ export function DataTable<TData, TValue>({
     }),
     [columnFilters, columnVisibility, columns, data, enablePagination, getRowId, pagination, sorting]
   )
+  // eslint-disable-next-line react-hooks/incompatible-library -- TanStack Table intentionally exposes a mutable table instance.
   const table = useReactTable(tableOptions)
 
   const filterValue = filterColumnId ? ((table.getColumn(filterColumnId)?.getFilterValue() as string) ?? '') : undefined
@@ -133,14 +134,15 @@ export function DataTable<TData, TValue>({
         </TableBody>
       </Table>
       {footerClassName == undefined || enablePagination ? (
-        footerClassName == undefined
-          ? enablePagination
-            ? <DataTablePagination table={table} />
-            : null
-          : enablePagination && footerClassName !== ''
-            ? <div className={cn('border-t border-border-soft', footerClassName)}><DataTablePagination table={table} /></div>
-            : null
-
+        footerClassName == undefined ? (
+          enablePagination ? (
+            <DataTablePagination table={table} />
+          ) : null
+        ) : enablePagination && footerClassName !== '' ? (
+          <div className={cn('border-t border-border-soft', footerClassName)}>
+            <DataTablePagination table={table} />
+          </div>
+        ) : null
       ) : null}
     </div>
   )
