@@ -918,6 +918,7 @@ mod tests {
             owner_control: Default::default(),
             telemetry: Default::default(),
             logging: Default::default(),
+            audit: Default::default(),
             defaults: None,
             runtime: Default::default(),
             extra: Default::default(),

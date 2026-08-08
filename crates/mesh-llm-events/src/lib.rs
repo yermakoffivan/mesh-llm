@@ -7,11 +7,13 @@ use std::io::{self, IsTerminal};
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock, RwLock};
 
+pub mod audit;
 pub mod logging;
 pub mod terminal_progress;
 
 mod command_lifecycle;
 pub use command_lifecycle::{CliCommandFamily, CliCommandOutcome, emit_cli_command_event};
+pub use audit::*;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 pub enum LogFormat {

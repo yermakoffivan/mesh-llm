@@ -1084,6 +1084,7 @@ fn legacy_proto_config_to_mesh(
         mesh_requirements,
         owner_control: Default::default(),
         telemetry: Default::default(),
+        audit: Default::default(),
         defaults: None,
         runtime: Default::default(),
         models,
