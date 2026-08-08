@@ -118,7 +118,11 @@ describe('buildRequestVolumeBuckets', () => {
 
   it('ignores unparseable timestamps', () => {
     const rows = [requestAt('not-a-date'), requestAt(iso(utc(12, 0)))]
-    const buckets = buildRequestVolumeBuckets(rows, { intervalMs: 3_600_000, rangeMs: Number.POSITIVE_INFINITY, now: utc(12, 0) })
+    const buckets = buildRequestVolumeBuckets(rows, {
+      intervalMs: 3_600_000,
+      rangeMs: Number.POSITIVE_INFINITY,
+      now: utc(12, 0)
+    })
     expect(buckets).toHaveLength(1)
     expect(buckets[0].total).toBe(1)
   })
@@ -131,9 +135,7 @@ describe('time label formatters', () => {
   })
 
   it('formats a bucket range with an en dash', () => {
-    expect(formatBucketRange(utc(10, 25), utc(10, 30))).toMatch(
-      /^\d{1,2}:25 (AM|PM)\u2013\d{1,2}:30 (AM|PM)$/
-    )
+    expect(formatBucketRange(utc(10, 25), utc(10, 30))).toMatch(/^\d{1,2}:25 (AM|PM)\u2013\d{1,2}:30 (AM|PM)$/)
   })
 
   it('drops minutes for hourly bucket ticks', () => {

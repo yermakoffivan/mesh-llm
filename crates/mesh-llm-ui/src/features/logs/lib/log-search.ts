@@ -4,8 +4,6 @@ import type { LogsRequestQuery } from '@/features/logs/api/client'
 export type RelativeTimePreset = '1h' | '6h' | '24h' | '7d' | ''
 
 export const RELATIVE_TIME_PRESETS: readonly { value: RelativeTimePreset; label: string }[] = [
-
-
   { value: '', label: 'All time' },
   { value: '1h', label: 'Last hour' },
   { value: '6h', label: 'Last 6 hours' },
@@ -70,18 +68,9 @@ export function formatRelativeTime(isoString: string): string {
 
 export type LogsFilterKey = 'model' | 'provider' | 'engine' | 'route' | 'source' | 'outcome'
 
-const FILTER_KEYS: readonly LogsFilterKey[] = [
-  'model',
-  'provider',
-  'engine',
-  'route',
-  'source',
-  'outcome'
-]
-
+const FILTER_KEYS: readonly LogsFilterKey[] = ['model', 'provider', 'engine', 'route', 'source', 'outcome']
 
 export type LogsLedgerSearch = {
-
   readonly focusRequestId?: string
   readonly replayCursor?: string
   readonly cursor?: string
@@ -130,7 +119,6 @@ export function parseLogsLedgerSearch(search: Record<string, unknown>): LogsLedg
 
   const pageCursor = cursor(search['cursor'])
 
-
   const focusRequestId = optionalString(search['focusRequestId'])
   const replayCursor = optionalString(search['replayCursor'])
   const trail = cursorTrail(search['trail'])
@@ -162,7 +150,6 @@ export function toLogsRequestQuery(search: LogsLedgerSearch): LogsRequestQuery {
     to: timeBounds?.to,
     model: search.model,
 
-
     provider: search.provider,
     engine: search.engine,
     route: search.route,
@@ -192,8 +179,11 @@ export function resetLogsSearch(_search: LogsLedgerSearch): LogsLedgerSearch {
   return {}
 }
 
-
-export function updateLogsFilter(search: LogsLedgerSearch, key: LogsFilterKey, value: string | undefined): LogsLedgerSearch {
+export function updateLogsFilter(
+  search: LogsLedgerSearch,
+  key: LogsFilterKey,
+  value: string | undefined
+): LogsLedgerSearch {
   return { ...search, [key]: value, cursor: undefined, trail: undefined }
 }
 

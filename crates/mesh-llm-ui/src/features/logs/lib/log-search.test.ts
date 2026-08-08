@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest'
-import { advanceLogsPage, formatRelativeTime, parseLogsLedgerSearch, resetLogsSearch, resolveRelativeTime, toLogsRequestQuery, updateLogsFilter, updateLogsTimeRange } from './log-search'
+import {
+  advanceLogsPage,
+  formatRelativeTime,
+  parseLogsLedgerSearch,
+  resetLogsSearch,
+  resolveRelativeTime,
+  toLogsRequestQuery,
+  updateLogsFilter,
+  updateLogsTimeRange
+} from './log-search'
 
 describe('logs ledger URL search', () => {
   it('restores supported filters and an opaque cursor from the route search (no time bounds without preset)', () => {
