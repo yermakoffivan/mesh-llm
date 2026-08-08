@@ -139,14 +139,23 @@ export function useLogsLiveRecovery({
   const timeBounds = useMemo(() => resolvedTimeBounds(search.timeRange), [search.timeRange])
 
   const filterScope = useMemo(
-    () => activeFilterScope(timeBounds, search.model, search.provider, search.engine, search.route, search.source, search.outcome),
-    [timeBounds.from ?? '', timeBounds.to ?? '', search.model ?? '', search.provider ?? '', search.engine ?? '', search.route ?? '', search.source ?? '']
+    () =>
+      activeFilterScope(
+        timeBounds,
+        search.model,
+        search.provider,
+        search.engine,
+        search.route,
+        search.source,
+        search.outcome
+      ),
+    [timeBounds, search.model, search.provider, search.engine, search.route, search.source, search.outcome]
   )
 
   const key = subscriptionKey(channels, filterScope, search.replayCursor)
   const subscriptionFilters = useMemo(
     () => streamFilters(timeBounds, search.model, search.provider, search.engine, search.route, search.outcome),
-    [timeBounds.from ?? '', timeBounds.to ?? '', search.model ?? '', search.provider ?? '', search.engine ?? '', search.route ?? '']
+    [timeBounds, search.model, search.provider, search.engine, search.route, search.outcome]
   )
 
   useEffect(() => {

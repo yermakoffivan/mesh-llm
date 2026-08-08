@@ -153,6 +153,17 @@ describe('useLogsLiveRecovery', () => {
     expect(sources[1]?.url).toBe('/api/logs/events?channel=requests&channel=operations&filter=route%3Amesh')
   })
 
+  it('reconnects with the new outcome when only the outcome filter changes', async () => {
+    const { rerender, sources } = renderLive({ search: { outcome: 'active' } })
+    await flush()
+
+    expect(sources[0]?.url).toBe('/api/logs/events?channel=requests&channel=operations&filter=outcome%3Aactive')
+    rerender({ search: { outcome: 'completed' } })
+
+    expect(sources[0]?.closed).toBe(true)
+    expect(sources[1]?.url).toBe('/api/logs/events?channel=requests&channel=operations&filter=outcome%3Acompleted')
+  })
+
   it('merges new request IDs in order while suppressing repeated sequence and event frames', async () => {
     const { hydrate, sources, result } = renderLive()
     await flush()
