@@ -274,6 +274,7 @@ export type ConfigurationDefaultsCategoryId =
   | 'meshllm'
   | 'network'
   | 'attestation'
+  | 'audit'
   | 'telemetry'
   | 'runtime-policy'
   | 'runtime'
@@ -509,6 +510,7 @@ export type ConfigurationHarnessData = {
   validationWarnings?: TomlValidationWarning[]
   launchSummaryConfig?: { httpBind?: string; mmap?: string }
   meshllm?: ConfigurationSettingsHarnessData
+  audit?: ConfigurationSettingsHarnessData
   runtimeSettings?: ConfigurationSettingsHarnessData
   modelSettings?: ConfigurationSettingsHarnessData
   network?: ConfigurationSettingsHarnessData

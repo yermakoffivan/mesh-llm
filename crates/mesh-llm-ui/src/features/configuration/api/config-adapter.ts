@@ -291,6 +291,7 @@ const CATEGORY_ICON_BY_ID: Record<string, ConfigurationDefaultsSetting['icon']> 
   meshllm: 'cpu',
   network: 'server',
   attestation: 'shield',
+  audit: 'shield',
   telemetry: 'gauge',
   'runtime-policy': 'cog',
   runtime: 'cpu',
@@ -360,6 +361,14 @@ const DEFAULTS_CATEGORY_FALLBACKS: Record<string, ConfigurationDefaultsCategory>
     help: 'Creation-time mesh requirement settings',
     tomlSection: 'mesh_requirements',
     order: 10
+  },
+  audit: {
+    id: 'audit',
+    label: 'Audit Logging',
+    summary: 'Security event recording and log rotation',
+    help: 'Audit logging settings written to the local config file',
+    tomlSection: 'audit',
+    order: 30
   },
   runtime: {
     id: 'runtime',
@@ -452,6 +461,7 @@ function configSectionForPath(canonicalPath: string) {
 
 function categoryForDefaultsPath(canonicalPath: string) {
   if (canonicalPath.startsWith('gpu.')) return 'runtime'
+  if (canonicalPath.startsWith('audit.')) return 'audit'
   if (canonicalPath.startsWith('telemetry.')) return 'telemetry'
   if (canonicalPath.startsWith('logging.')) return 'logging'
   if (canonicalPath === 'runtime.debug') return 'meshllm'
@@ -784,6 +794,18 @@ export function createConfigurationAttestationSettingsFromSchema(
     schema,
     (entry) => entry.canonical_path.startsWith('mesh_requirements.'),
     'Generated attestation settings',
+    controlState
+  )
+}
+
+export function createConfigurationAuditSettingsFromSchema(
+  schema: RuntimeConfigSchemaReference | undefined,
+  controlState?: RuntimeConfigControlStatePayload
+): ConfigurationSettingsHarnessData {
+  return createConfigurationSettingsFromSchema(
+    schema,
+    (entry) => entry.canonical_path.startsWith('audit.'),
+    'Generated audit logging settings',
     controlState
   )
 }
@@ -1609,7 +1631,8 @@ function builtInSettingsFromSchema(
     createConfigurationRuntimeSettingsFromSchema(schema, controlState),
     createConfigurationModelSettingsFromSchema(schema, controlState),
     createConfigurationNetworkSettingsFromSchema(schema, controlState),
-    createConfigurationAttestationSettingsFromSchema(schema, controlState)
+    createConfigurationAttestationSettingsFromSchema(schema, controlState),
+    createConfigurationAuditSettingsFromSchema(schema, controlState)
   ]) {
     for (const setting of group.settings) byId.set(setting.id, setting)
   }
@@ -2054,6 +2077,7 @@ export function adaptStatusToConfiguration(
   const modelSettings = createConfigurationModelSettingsFromSchema(schema, controlState)
   const network = createConfigurationNetworkSettingsFromSchema(schema, controlState)
   const attestation = createConfigurationAttestationSettingsFromSchema(schema, controlState)
+  const auditSettings = createConfigurationAuditSettingsFromSchema(schema, controlState)
   const schemaIntegrations = createConfigurationIntegrationsFromSchema(schema, controlState)
   const overlay = (settings: ConfigurationSettingsHarnessData) =>
     defaultsValues ? overlayDefaultsValues(settings, defaultsValues) : settings
@@ -2062,7 +2086,7 @@ export function adaptStatusToConfiguration(
       ? overlayDefaultsValues(schemaIntegrations, defaultsValues)
       : schemaIntegrations
   const legacyDefaults = overlay(
-    combineSettingsHarnessData(meshllmSettings, runtimeSettings, modelSettings, network, attestation)
+    combineSettingsHarnessData(meshllmSettings, runtimeSettings, modelSettings, network, attestation, auditSettings)
   )
 
   return {
@@ -2075,6 +2099,7 @@ export function adaptStatusToConfiguration(
     modelSettings: overlay(modelSettings),
     network: overlay(network),
     attestation: overlay(attestation),
+    audit: overlay(auditSettings),
     plugins,
     integrations: plugins,
     validationWarnings: undefined,

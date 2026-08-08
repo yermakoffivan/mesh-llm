@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import {
   adaptStatusToConfiguration,
+  createConfigurationAuditSettingsFromSchema,
   createConfigurationDefaultsFromSchema,
   createConfigurationDefaultsValuesFromMeshConfig,
   createConfigurationIntegrationsFromSchema,
@@ -465,6 +466,21 @@ const CUSTOM_MODEL_PLACEMENT_SCHEMA: RuntimeConfigSchemaReference = {
     schemaSetting('models.<model-ref>.runtime.context', 'model-placement-context', { kind: 'integer' }),
     schemaSetting('models.<model-ref>.accelerator.target', 'model-placement-device', { kind: 'string' }),
     schemaSetting('models.<model-ref>.accelerator.layers', 'model-placement-gpu-layers', { kind: 'integer' })
+  ]
+}
+
+const AUDIT_SCHEMA: RuntimeConfigSchemaReference = {
+  ...SCHEMA_REFERENCE,
+  settings: [
+    ...SCHEMA_REFERENCE.settings,
+    { ...schemaSetting('audit.enabled', 'audit-enabled', { kind: 'boolean' }), presentation: undefined },
+    {
+      ...schemaSetting('audit.log_format', 'audit-log-format', {
+        kind: 'enum',
+        values: ['json', 'json_lines']
+      }),
+      presentation: undefined
+    }
   ]
 }
 
@@ -1446,6 +1462,34 @@ describe('adaptStatusToConfiguration', () => {
     expect(formatConfigDiagnostics(diagnostics)).toContain('logging.retention_ttl_secs')
     expect(formatConfigDiagnostics(diagnostics)).toContain('unsupported')
     expect(diagnostics[1]?.schema_source).toBe('built_in')
+  })
+  it('places audit settings in a dedicated category and config section', () => {
+    const audit = createConfigurationAuditSettingsFromSchema(AUDIT_SCHEMA)
+    const configuration = adaptStatusToConfiguration(STATUS_PAYLOAD, [], undefined, AUDIT_SCHEMA)
+
+    expect(audit.categories).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'audit',
+          label: 'Audit Logging',
+          tomlSection: 'audit'
+        })
+      ])
+    )
+    expect(audit.settings).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: 'audit.enabled',
+          categoryId: 'audit',
+          tomlSection: 'audit',
+          icon: 'shield'
+        })
+      ])
+    )
+    expect(configuration.audit?.settings.map((setting) => setting.id)).toEqual(['audit.enabled', 'audit.log_format'])
+    expect(configuration.defaults.settings.map((setting) => setting.id)).toEqual(
+      expect.arrayContaining(['audit.enabled', 'audit.log_format'])
+    )
   })
 
   it('places gpu assignment controls on the models tab instead of meshllm', () => {
