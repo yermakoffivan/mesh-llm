@@ -71,7 +71,9 @@ function ChartStyle({ id, config }: { readonly id: string; readonly config: Char
   return <style>{css}</style>
 }
 
-export const ChartTooltip = RechartsPrimitive.Tooltip
+export function ChartTooltip(props: ComponentProps<typeof RechartsPrimitive.Tooltip>) {
+  return <RechartsPrimitive.Tooltip {...props} />
+}
 
 type ChartTooltipContentProps = {
   readonly active?: boolean
@@ -128,9 +130,12 @@ export function ChartTooltipContent({
           const itemName = nameKey && item.payload ? String(item.payload[nameKey]) : item.name
           const itemConfig = itemName ? config[itemName] : undefined
           const color = item.color ?? itemConfig?.color ?? configItem?.color
-          const displayName = hideName ? undefined : itemConfig?.label ?? itemName
+          const displayName = hideName ? undefined : (itemConfig?.label ?? itemName)
           return (
-            <div key={`chart-item-${String(itemName ?? '')}-${String(dataKey ?? '')}`} className="flex items-center gap-2">
+            <div
+              key={`chart-item-${String(itemName ?? '')}-${String(dataKey ?? '')}`}
+              className="flex items-center gap-2"
+            >
               {!hideIndicator && indicator !== 'none' ? (
                 <span
                   aria-hidden="true"
