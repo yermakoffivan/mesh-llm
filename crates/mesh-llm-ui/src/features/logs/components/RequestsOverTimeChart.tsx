@@ -26,10 +26,11 @@ const chartConfig = {
 export function RequestsOverTimeChart({ rows, now }: RequestsOverTimeChartProps) {
   const [intervalKey, setIntervalKey] = useState<BucketIntervalKey>('5m')
   const [rangeKey, setRangeKey] = useState<VolumeTimeRangeKey>('12h')
+  const [initialNow] = useState(() => Date.now())
 
   const intervalMs = BUCKET_INTERVALS.find((option) => option.value === intervalKey)?.ms ?? 300_000
   const rangeMs = VOLUME_TIME_RANGES.find((option) => option.value === rangeKey)?.ms ?? 43_200_000
-  const current = now ?? Date.now()
+  const current = now ?? initialNow
 
   const data = useMemo(
     () => buildRequestVolumeBuckets(rows, { intervalMs, rangeMs, now: current }),
