@@ -35,7 +35,9 @@ use crate::network::{
 use crate::plugin;
 use crate::runtime::release_attestation;
 use crate::runtime::survey;
-use crate::runtime::{InstanceLifecycleRecord, InstanceLifecycleState};
+use crate::runtime::{
+    InstanceLifecycleRecord, InstanceLifecycleState, tracing_writer::init_audit_logging,
+};
 use crate::system::{autoupdate, benchmark, hardware};
 use anyhow::Result;
 use mesh_llm_events::{LogFormat, OutputEvent, RuntimeStatus, emit_event, output_sink};
@@ -281,6 +283,37 @@ pub(super) async fn run_runtime_cli(
     options.client = effective_mode == mesh_llm_config::RuntimeMode::Client;
     apply_runtime_cli_speculative_overrides(&mut config, options.speculative_overrides.as_ref());
     apply_runtime_config_options(&mut options, &config);
+
+    // Initialize audit logging if configured
+    let audit_enabled = config.audit.enabled.unwrap_or(false);
+    if audit_enabled {
+        init_audit_logging(
+            config.audit.log_path.clone(),
+            config
+                .audit
+                .log_format
+                .as_deref()
+                .and_then(|s| match s {
+                    "json" => Some(mesh_llm_events::audit::AuditLogFormat::Json),
+                    "json_lines" => Some(mesh_llm_events::audit::AuditLogFormat::JsonLines),
+                    _ => None,
+                })
+                .unwrap_or(mesh_llm_events::audit::AuditLogFormat::JsonLines),
+            config
+                .audit
+                .log_level
+                .as_deref()
+                .and_then(|s| match s {
+                    "info" => Some(mesh_llm_events::audit::AuditLevel::Info),
+                    "warn" => Some(mesh_llm_events::audit::AuditLevel::Warn),
+                    "error" => Some(mesh_llm_events::audit::AuditLevel::Error),
+                    "critical" => Some(mesh_llm_events::audit::AuditLevel::Critical),
+                    _ => None,
+                })
+                .unwrap_or(mesh_llm_events::audit::AuditLevel::Info),
+        )?;
+    }
+
     let startup_mesh_creation_state = resolve_startup_mesh_creation_state(&options, &config)?;
     let cli_has_explicit_models = cli_has_explicit_models(&options);
     let has_config_models = !config.models.is_empty();
@@ -341,6 +374,33 @@ pub(super) fn apply_runtime_config_options(
 ) {
     options.debug |= config.runtime.debug;
     options.listen_all |= config.runtime.listen_all;
+
+    let audit_enabled = config.audit.enabled.unwrap_or(false);
+    if audit_enabled {
+        options.audit_log_path = config.audit.log_path.clone();
+        options.audit_log_format = config
+            .audit
+            .log_format
+            .as_deref()
+            .and_then(|s| match s {
+                "json" => Some(mesh_llm_events::audit::AuditLogFormat::Json),
+                "json_lines" => Some(mesh_llm_events::audit::AuditLogFormat::JsonLines),
+                _ => None,
+            })
+            .unwrap_or(mesh_llm_events::audit::AuditLogFormat::JsonLines);
+        options.audit_log_level = config
+            .audit
+            .log_level
+            .as_deref()
+            .and_then(|s| match s {
+                "info" => Some(mesh_llm_events::audit::AuditLevel::Info),
+                "warn" => Some(mesh_llm_events::audit::AuditLevel::Warn),
+                "error" => Some(mesh_llm_events::audit::AuditLevel::Error),
+                "critical" => Some(mesh_llm_events::audit::AuditLevel::Critical),
+                _ => None,
+            })
+            .unwrap_or(mesh_llm_events::audit::AuditLevel::Info);
+    }
 }
 
 pub(in crate::runtime) fn apply_runtime_cli_speculative_overrides(
