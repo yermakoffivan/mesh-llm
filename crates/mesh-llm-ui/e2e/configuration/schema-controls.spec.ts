@@ -180,6 +180,22 @@ const schemaPayload = {
         write_policy: 'omit_when_disabled'
       }
     }),
+    auditSetting('audit.enabled', {
+      label: 'Audit logging enabled',
+      help: 'Record security-relevant events to the configured audit sink.',
+      value_schema: { kind: 'boolean' },
+      control_hint: 'toggle',
+      apply_mode: 'dynamic_apply',
+      restart_scope: 'none'
+    }),
+    auditSetting('audit.log_format', {
+      label: 'Audit log format',
+      help: 'Choose the serialized format for audit events.',
+      value_schema: { kind: 'enum', values: ['json', 'json_lines'] },
+      control_hint: 'select',
+      apply_mode: 'dynamic_apply',
+      restart_scope: 'none'
+    }),
     setting('plugin.blackboard.settings.endpoint', {
       owner: 'plugin',
       source: { kind: 'plugin', plugin_name: 'blackboard', allow_unvalidated_config: true },
@@ -234,6 +250,7 @@ const initialConfig = {
     speculative: { mode: 'disabled', draft_min_tokens: 4 },
     multimodal: { mmproj_path: './existing/mmproj.gguf', mmproj_url: 'https://example.com/mmproj.gguf' }
   },
+  audit: { enabled: true, log_format: 'json_lines' },
   gpu: { assignment: 'auto' },
   runtime: { native_backend: 'metal' },
   owner_control: {},
@@ -289,6 +306,28 @@ function setting(
       unit: options.unit
     },
     control_behavior: options.control_behavior
+  }
+}
+
+function auditSetting(
+  canonicalPath: string,
+  options: {
+    label: string
+    help: string
+    value_schema: JsonRecord
+    control_hint?: string
+    apply_mode?: string
+    restart_scope?: string
+  }
+) {
+  const entry = setting(canonicalPath, {
+    ...options,
+    category_id: 'audit',
+    category_label: 'Audit Logging'
+  })
+  return {
+    ...entry,
+    presentation: options.control_hint ? { control_hint: options.control_hint } : undefined
   }
 }
 
@@ -501,6 +540,30 @@ test.describe('schema-driven configuration controls', () => {
       .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa'])
       .analyze()
     expect(results.violations).toEqual([])
+  })
+
+  test('renders audit settings in the dedicated Audit Logging tab', async ({ page }, testInfo) => {
+    await page.goto(appUrl('/configuration/audit', testInfo))
+
+    await expect(page.getByRole('heading', { name: 'Configuration' })).toBeVisible()
+    await expect(page.getByRole('tab', { name: 'Audit Logging' })).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Audit logging', exact: true })).toBeVisible()
+    await expect(page.getByRole('radiogroup', { name: 'Enabled' }).getByRole('radio', { name: 'on' })).toBeChecked()
+    await expect(page.getByRole('combobox', { name: 'Log Format' })).toHaveValue('json_lines')
+    await expect(page.getByText(/Written to config\.toml under the \[audit\] section/)).toBeVisible()
+
+    await expectNoHorizontalOverflow(page)
+    await testInfo.attach('audit-settings-desktop', {
+      body: await page.screenshot({ fullPage: true, animations: 'disabled' }),
+      contentType: 'image/png'
+    })
+
+    await page.setViewportSize({ width: 390, height: 720 })
+    await expectNoHorizontalOverflow(page)
+    await testInfo.attach('audit-settings-mobile', {
+      body: await page.screenshot({ fullPage: true, animations: 'disabled' }),
+      contentType: 'image/png'
+    })
   })
 
   test('writes edited settings to TOML preview and applies the same config payload', async ({ page }, testInfo) => {
