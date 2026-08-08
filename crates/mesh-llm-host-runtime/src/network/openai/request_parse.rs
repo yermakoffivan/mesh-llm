@@ -47,6 +47,7 @@ struct ParsedHeaders {
     content_length: Option<usize>,
     is_chunked: bool,
     expects_continue: bool,
+    correlation_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -69,6 +70,7 @@ pub struct BufferedHttpRequest {
     pub model_name: Option<String>,
     pub request_object_request_ids: Vec<String>,
     pub response_adapter: ResponseAdapter,
+    pub correlation_id: Option<String>,
 }
 
 impl BufferedHttpRequest {
@@ -264,6 +266,7 @@ pub(super) async fn read_http_request_with_limits(
         request_object_request_ids: rewrite.request_object_request_ids,
         response_adapter,
         request_id: parsed.request_id,
+        correlation_id: parsed.correlation_id,
     })
 }
 
@@ -480,6 +483,7 @@ async fn read_until_headers_parsed(
                 let mut content_length = None;
                 let mut is_chunked = false;
                 let mut expects_continue = false;
+                let mut correlation_id = None;
 
                 for header in req.headers.iter() {
                     if header.name.eq_ignore_ascii_case("content-length") {
@@ -500,6 +504,12 @@ async fn read_until_headers_parsed(
                         expects_continue = val
                             .split(',')
                             .any(|part| part.trim().eq_ignore_ascii_case("100-continue"));
+                    } else if header.name.eq_ignore_ascii_case("x-correlation-id")
+                        || header.name.eq_ignore_ascii_case("x-request-id")
+                        || header.name.eq_ignore_ascii_case("correlation-id")
+                    {
+                        correlation_id =
+                            Some(std::str::from_utf8(header.value).unwrap_or("").to_string());
                     }
                 }
 
@@ -517,6 +527,7 @@ async fn read_until_headers_parsed(
                     content_length,
                     is_chunked,
                     expects_continue,
+                    correlation_id,
                 });
             }
             Ok(httparse::Status::Partial) => {
@@ -1278,6 +1289,7 @@ mod tests {
             stream: None,
             request_object_request_ids: Vec::new(),
             response_adapter: ResponseAdapter::None,
+            correlation_id: None,
         };
 
         rewrite_public_model_alias(&mut request, &models, &descriptors);
@@ -1655,6 +1667,7 @@ mod tests {
             stream: None,
             request_object_request_ids: Vec::new(),
             response_adapter: ResponseAdapter::None,
+            correlation_id: None,
         };
 
         rewrite_model_field(&mut request, "SmolLM2-135M-Instruct-Q8_0");

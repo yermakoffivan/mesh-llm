@@ -136,6 +136,15 @@ fn build_built_in_config_schema() -> ConfigSchema {
             "Prompt-shape telemetry is intentionally disabled until the telemetry surface is reviewed.",
         ),
         telemetry_setting("telemetry.metrics.endpoint", ConfigValueSchema::Url),
+        audit_setting("audit.enabled", ConfigValueSchema::Boolean),
+        audit_setting("audit.log_path", ConfigValueSchema::Path),
+        audit_setting("audit.log_format", string_enum(["json", "json_lines"])),
+        audit_setting(
+            "audit.log_level",
+            string_enum(["info", "warn", "error", "critical"]),
+        ),
+        audit_setting("audit.max_file_size_mb", ConfigValueSchema::Integer),
+        audit_setting("audit.max_files", ConfigValueSchema::Integer),
         startup_runtime_setting("runtime.debug", ConfigValueSchema::Boolean),
         startup_runtime_setting("runtime.listen_all", ConfigValueSchema::Boolean),
         startup_runtime_setting(
@@ -997,6 +1006,13 @@ fn owner_control_setting(path: &str, value_schema: ConfigValueSchema) -> ConfigS
 fn telemetry_setting(path: &str, value_schema: ConfigValueSchema) -> ConfigSettingSchema {
     let mut setting = basic_setting(path, value_schema);
     setting.control_surfaces = vec![ConfigControlSurface::ConfigFile, ConfigControlSurface::Api];
+    setting
+}
+
+fn audit_setting(path: &str, value_schema: ConfigValueSchema) -> ConfigSettingSchema {
+    let mut setting = basic_setting(path, value_schema);
+    setting.control_surfaces = vec![ConfigControlSurface::ConfigFile, ConfigControlSurface::Api];
+    setting.apply_mode = ConfigApplyMode::DynamicApply;
     setting
 }
 

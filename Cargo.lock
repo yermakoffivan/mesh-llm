@@ -3846,11 +3846,13 @@ name = "mesh-llm-events"
 version = "0.72.1"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "crossterm 0.28.1",
  "ratatui",
  "serde",
  "serde_json",
+ "tracing",
  "uuid",
 ]
 

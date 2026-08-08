@@ -2169,7 +2169,7 @@ async fn audit_enqueue_shares_identity_with_durable_row() {
         })
         .collect();
     assert_eq!(audit_records.len(), 1);
-    let (durable_level, durable_message, durable_entry_id, durable_occurred_at) = &audit_records[0];
+    let (_, _, durable_entry_id, durable_occurred_at) = &audit_records[0];
 
     let bus_entries = service.bus_ref().audit_replay_window();
     assert_eq!(bus_entries.records.len(), 1);

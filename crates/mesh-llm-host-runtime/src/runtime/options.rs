@@ -1,7 +1,10 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
-use mesh_llm_events::LogFormat;
+use mesh_llm_events::{
+    LogFormat,
+    audit::{AuditLevel, AuditLogFormat},
+};
 
 use crate::crypto::TrustPolicy;
 use crate::discovery::MeshDiscoveryMode;
@@ -90,6 +93,9 @@ pub struct RuntimeOptions {
     pub trust_policy: Option<TrustPolicy>,
     pub trust_owner: Vec<String>,
     pub nostr_discovery: bool,
+    pub audit_log_path: Option<PathBuf>,
+    pub audit_log_format: AuditLogFormat,
+    pub audit_log_level: AuditLevel,
 }
 
 impl Default for RuntimeOptions {
@@ -162,6 +168,9 @@ impl Default for RuntimeOptions {
             trust_policy: None,
             trust_owner: Vec::new(),
             nostr_discovery: false,
+            audit_log_path: None,
+            audit_log_format: AuditLogFormat::JsonLines,
+            audit_log_level: AuditLevel::Info,
         }
     }
 }
