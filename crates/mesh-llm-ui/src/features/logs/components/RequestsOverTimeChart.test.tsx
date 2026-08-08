@@ -71,11 +71,7 @@ describe('RequestsOverTimeChart', () => {
   })
 
   it('renders the chart frame when requests fall inside the window', () => {
-    const rows = [
-      requestAt(iso(NOW - 10 * 60_000)),
-      requestAt(iso(NOW - 5 * 60_000)),
-      requestAt(iso(NOW))
-    ]
+    const rows = [requestAt(iso(NOW - 10 * 60_000)), requestAt(iso(NOW - 5 * 60_000)), requestAt(iso(NOW))]
     render(<RequestsOverTimeChart rows={rows} now={NOW} />)
 
     expect(screen.queryByText(EMPTY_MESSAGE)).not.toBeInTheDocument()

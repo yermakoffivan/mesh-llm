@@ -85,7 +85,6 @@ describe('LogsLedger', () => {
     expect(onRequestOpen).toHaveBeenCalledWith(REQUEST_A, expect.objectContaining({ focusRequestId: REQUEST_A }))
   })
 
-
   it('clears time and category filters with an accessible reset action', async () => {
     const user = userEvent.setup()
     const onSearchChange = vi.fn()
@@ -105,11 +104,7 @@ describe('LogsLedger', () => {
     const user = userEvent.setup()
     // A filtered search keeps the Reset control enabled so it participates in the tab order.
     render(
-      <LogsLedger
-        onRequestOpen={vi.fn()}
-        search={parseLogsLedgerSearch({ model: 'Qwen3' })}
-        onSearchChange={vi.fn()}
-      />
+      <LogsLedger onRequestOpen={vi.fn()} search={parseLogsLedgerSearch({ model: 'Qwen3' })} onSearchChange={vi.fn()} />
     )
 
     await user.tab()
