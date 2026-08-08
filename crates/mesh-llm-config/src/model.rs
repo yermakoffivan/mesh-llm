@@ -34,6 +34,8 @@ pub struct MeshConfig {
     #[serde(default)]
     pub logging: LoggingConfig,
     #[serde(default)]
+    pub audit: AuditConfig,
+    #[serde(default)]
     pub defaults: Option<ModelConfigDefaults>,
     #[serde(default)]
     pub runtime: RuntimeConfig,
@@ -1042,6 +1044,8 @@ struct RawMeshConfig {
     #[serde(default)]
     logging: LoggingConfig,
     #[serde(default)]
+    audit: AuditConfig,
+    #[serde(default)]
     defaults: Option<ModelConfigDefaults>,
     #[serde(default)]
     runtime: RuntimeConfig,
@@ -1143,6 +1147,7 @@ impl<'de> Deserialize<'de> for MeshConfig {
             owner_control: raw.owner_control,
             telemetry: raw.telemetry,
             logging: raw.logging,
+            audit: raw.audit,
             defaults: raw.defaults,
             runtime: raw.runtime,
             models: raw.models,
@@ -1360,6 +1365,22 @@ pub struct TelemetryConfig {
     pub prompt_shape_metrics: bool,
     #[serde(default)]
     pub metrics: TelemetryMetricsConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AuditConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub log_path: Option<std::path::PathBuf>,
+    #[serde(default)]
+    pub log_format: Option<String>,
+    #[serde(default)]
+    pub log_level: Option<String>,
+    #[serde(default)]
+    pub max_file_size_mb: Option<u64>,
+    #[serde(default)]
+    pub max_files: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
